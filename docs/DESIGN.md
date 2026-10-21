@@ -1,6 +1,6 @@
 # In-house SEM: Architecture & Roadmap
 
-Status: **draft for review**. Nothing here is implemented yet.
+Status: **draft v2 for review**. Nothing here is implemented yet.
 
 A spectral element method (SEM) simulator for wave propagation in coupled
 acoustic (fluid) and elastic (solid) media. Its first targets are
@@ -9,21 +9,51 @@ events recorded by downhole geophones, hydrophones and DAS fibers.
 
 ---
 
+## 0. Originality and clean-room policy
+
+This is an independent design, **not a port or restructuring of SPECFEM**
+(or any other SEM code). Its main departures from the SPECFEM family are:
+
+| Topic | Typical SPECFEM approach | This code |
+|---|---|---|
+| Fluid unknown | displacement potential χ | **pressure p** (§2.2) |
+| Operator structure | one global loop over all elements; colouring (CPU) or atomics (GPU) to add up element contributions | **element blocks** + gather → local kernel → **deterministic scatter**: no colouring, no atomics, reproducible results (§7.3) |
+| Mesh refinement | conforming "doubling" bricks built by hand | **forest of quadtrees** (octrees in 3D) with λ-driven adaptive refinement and hanging-node constraints (§6) |
+| Workflow | separate mesher → database → solver programs | **library-first**: one `Simulation` object; the case file is its serialisation; partitioning happens at load (§7.1) |
+| Time stepping | global Newmark | pluggable integrators; **multi-rate local time stepping** planned (§3.2) |
+| Partitioning | external graph partitioner | **space-filling curve** over the forest, weighted by cost (§7.4) |
+
+**Clean-room rule.** SPECFEM is GPL-3. p4est, which provides the
+forest-of-trees ideas, is GPL-2. No code from either, nor from any other
+copyleft code, is copied, translated or used as a template. Implementation
+works only from published papers and textbooks. Running other codes as
+**black-box references** to compare outputs is allowed. All dependencies must be
+permissively licensed (BSD, MIT or Apache) or LGPL linked dynamically.
+
+The core SEM mathematics is standard textbook material and is used as such:
+GLL collocation, diagonal mass matrix, Stacey and PML absorbing boundaries.
+References include Patera 1984, Maday & Rønquist 1990, Komatitsch & Vilotte
+1998, Fichtner 2011, and Deville, Fischer & Mund 2002.
+
+---
+
 ## 1. Decisions so far
 
 | Topic | Decision |
 |---|---|
 | Language | C++17 core, Python bindings (pybind11) |
-| Dimensions | 2D first (Cartesian **and** axisymmetric r–z); code structured so 3D hexahedra slot in later |
-| Physics v1 | Isotropic acoustic + isotropic elastic + **fluid–solid coupling** |
-| Physics later | Anisotropy (VTI/TTI), attenuation (SLS memory variables), topography, azimuthal Fourier (2.5D) |
-| Meshing | In-house structured/layered mesher (conforming interfaces, borehole geometry) + Gmsh `.msh` import; solver works on generic unstructured quads (hexes later) |
+| Dimensions | 2D first (Cartesian **and** axisymmetric r–z); designed so 3D (hex, octree) slots in |
+| Physics v1 | isotropic acoustic (**pressure**) + isotropic elastic + **fluid–solid coupling** |
+| Physics later | anisotropy (VTI/TTI), attenuation, topography, azimuthal Fourier (2.5D) |
+| Meshing | conforming **macro-mesh** (in-house layered/borehole templates or Gmsh import) refined by a **forest of quadtrees** with hanging nodes |
+| Operators | matrix-free, element blocks, deterministic gather/scatter |
+| Time stepping | pluggable integrators (central difference first), local time stepping planned |
 | Absorbing BC | Stacey first, C-PML next |
-| Parallelism | **Native CUDA + separate CPU (OpenMP) code**, **MPI** domain decomposition |
-| Precision | Templated on real type; `float` default, `double` build for verification |
-| User interface | Python API is primary; YAML is a thin layer that maps onto the same API |
-| Output | HDF5 (traces, DAS, metadata, snapshots) + SEG-Y export + XDMF/VTK for ParaView |
-| Units | SI throughout (m, s, kg/m³, Pa) |
+| Parallelism | native CUDA + separate CPU (OpenMP) code, MPI with SFC partitioning |
+| Precision | templated on real type; `float` default, `double` for verification |
+| User interface | Python API and C++ API over one `Simulation` object; YAML is a thin layer over the Python API |
+| Output | HDF5 + SEG-Y export + XDMF for ParaView |
+| Units | SI (m, s, kg/m³, Pa) |
 
 ---
 
@@ -36,290 +66,322 @@ $$\rho\,\ddot{\mathbf u} = \nabla\cdot\boldsymbol\sigma + \mathbf f,\qquad
 \boldsymbol\varepsilon = \tfrac12(\nabla\mathbf u + \nabla\mathbf u^T)$$
 
 Weak form: $\int \rho\,\mathbf w\cdot\ddot{\mathbf u} = -\int \nabla\mathbf w:\boldsymbol\sigma + \int \mathbf w\cdot\mathbf f + \oint \mathbf w\cdot\mathbf t$.
-The free surface is the natural condition (**t** = 0) and needs no code.
+The free surface is the natural condition (**t** = 0).
 
-The constitutive law is kept behind one point-wise function (`stress_from_strain`).
-Anisotropy (a full `C_ij` per GLL point) and attenuation (memory variables)
-later replace that function without changing the element kernels.
+The constitutive law sits behind one point-wise function. Anisotropy and
+attenuation later replace that function and add state; they do not change the
+operator structure.
 
-### 2.2 Acoustic (fluid): potential formulation
+### 2.2 Acoustic (fluid): pressure formulation
 
-We use the displacement potential χ (as in Chaljub & Valette 2004 and
-SPECFEM2D), because it makes coupling with the solid cheap and explicit:
+We solve directly for pressure, which is the quantity that hydrophones and
+borehole sonic receivers measure. From ρ ü = −∇p and p = −κ ∇·u:
 
-$$\mathbf u = \tfrac{1}{\rho}\nabla\chi,\qquad p = -\ddot\chi,\qquad
-\tfrac{1}{\kappa}\,\ddot\chi = \nabla\cdot\!\left(\tfrac{1}{\rho}\nabla\chi\right) + s$$
+$$\tfrac{1}{\kappa}\,\ddot p = \nabla\cdot\!\left(\tfrac{1}{\rho}\nabla p\right) + \ddot Q\,\delta_{x_s}$$
 
-Weak form: $\int \tfrac1\kappa w\ddot\chi = -\int \tfrac1\rho\nabla w\cdot\nabla\chi + \oint w\,(\mathbf n\cdot\mathbf u) + \int w s$.
+Here Q(t) is the injected volume (monopole source).
 
-* Pressure-release surface (p = 0): Dirichlet χ = 0.
-* Rigid wall: natural condition (n·u = 0).
-* Density may vary inside the fluid (mud, brine and gas layers).
+Weak form, with **n**_f the outward normal of the fluid:
+$$\int \tfrac1\kappa\, w\,\ddot p = -\int \tfrac1\rho\nabla w\cdot\nabla p \;-\; \oint w\,(\mathbf n_f\cdot\ddot{\mathbf u}) \;+\; w(x_s)\,\ddot Q$$
+This follows because (1/ρ) **n**·∇p = −**n**·ü.
+
+* Pressure-release surface: Dirichlet p = 0.
+* Rigid wall: natural condition (**n**·ü = 0).
+* Variable density inside the fluid (mud, brine, gas layers) is handled exactly by the 1/ρ inside the divergence.
+* Fluid particle velocity (for vector hydrophones and DAS in fluid) comes from
+  integrating v̇ = −∇p/ρ in time at the receiver point. This is cheap and local.
 
 ### 2.3 Fluid–solid coupling
 
-The two conditions on the interface Γ are continuity of normal displacement
-and traction **t** = −p **n**:
+The interface conditions are continuity of normal acceleration and traction
+**σ** **n**_s = −p **n**_s, where **n**_s = −**n**_f.
 
-* **Fluid side:** the boundary term above takes $\mathbf n\cdot\mathbf u_{\text{solid}}$.
-* **Solid side:** the traction term becomes $\oint \mathbf w\cdot(\ddot\chi\,\mathbf n)$, with **n** pointing out of the solid.
+* **Solid side:** the traction term becomes $\oint \mathbf w\cdot(p\,\mathbf n_f)$. It needs p.
+* **Fluid side:** the boundary term above, $-\oint w\,\mathbf n_f\cdot\ddot{\mathbf u}_s$. It needs ü of the solid.
 
-Explicit time stepping order per step (no iteration needed):
-1. Newmark predictor for all fields.
-2. Fluid: internal forces + coupling term from the predicted solid displacement → solve for χ̈.
-3. Solid: internal forces + coupling traction from the **new** χ̈ → solve for ü.
-4. Newmark corrector.
+Explicit ordering within one acceleration evaluation (no iteration):
+1. **Solid:** internal forces + coupling traction from the current pressure pⁿ → üⁿ.
+2. **Fluid:** internal forces + coupling term from the just-computed üⁿ → p̈ⁿ.
 
-The mesh must be **conforming** at Γ, meaning GLL points are shared
-geometrically but the fields are separate. Interface edges are found once
-during setup and stored as (fluid element, solid element, edge, normal,
-weight·jacobian) lists.
+The ordering lives inside the coupled system's `evaluate_acceleration`, so every
+time integrator (§3.2) inherits it.
+
+Interfaces are stored as their own objects: (fluid face, solid face, quadrature
+points, normal, weight × surface Jacobian). Both sides of a fluid–solid
+interface must be refined to the same level, so the interface points match one
+to one. The mesh balancing step (§6.2) enforces this.
 
 ### 2.4 Axisymmetric (r–z) formulation, for boreholes
 
-A borehole with a monopole source on its axis is a 3D problem with
-rotational symmetry. Solving it on an (r, z) quad mesh gives the true 3D
-wavefield (P and S head waves, Stoneley wave, pseudo-Rayleigh modes) at 2D cost.
+A borehole with a monopole source on its axis is a 3D problem with rotational
+symmetry. Solving it on an (r, z) mesh gives the true 3D wavefield (P and S
+head waves, Stoneley, pseudo-Rayleigh) at 2D cost.
 
-* Volume element: dΩ = 2π r dr dz, so every integral is weighted by r.
-* Elastic unknowns (u_r, u_z) form a P–SV-like system. The strain has an extra hoop
-  component ε_θθ = u_r / r. (The torsional u_θ part decouples and is optional.)
-* Fluid unknown: χ(r, z) with the same r-weighting.
-* **On the axis (r = 0):** in elements touching the axis we use
-  **Gauss–Lobatto–Jacobi (0,1)** points in the r-direction instead of GLL
-  (Bernardi et al.; Nissen-Meyer et al. 2007, AxiSEM; Bottero et al. 2016,
-  SPECFEM2D-axisym). That quadrature absorbs the r weight and removes the 1/r
-  singularity. Axis condition: u_r = 0, with u_r/r → ∂u_r/∂r on the axis.
-* Element kernels differ from Cartesian 2D only in (a) the extra hoop terms,
-  (b) the quadrature weights, and (c) the derivative matrix on axial elements.
-  They are a template specialisation of the same kernel, not a separate code path.
+* Volume element: dΩ = 2π r dr dz. Every integral carries an r weight.
+* Elastic unknowns (u_r, u_z), with hoop strain ε_θθ = u_r / r. Torsional u_θ decouples and is optional.
+* Fluid unknown: p(r, z).
+* **Axis (r = 0):** elements touching the axis use **Gauss–Lobatto–Jacobi
+  (0,1)** points in r. This absorbs the r weight and removes the 1/r
+  singularity (Bernardi, Dauge & Maday 1999; Nissen-Meyer et al. 2007). The axis
+  condition is u_r = 0, with u_r/r → ∂u_r/∂r on the axis.
+* Axisymmetry is a **geometry kind**, not a separate solver (§7.3). Axial and
+  off-axis axisymmetric elements are separate element-block types with their own
+  quadrature and hoop terms.
 
 **Limitation that matters for microseismic:** pure axisymmetry only allows
-sources **on the axis** whose radiation is axisymmetric: explosion, vertical
-force, and vertical CLVD or dipole. A general moment-tensor event off the
-borehole axis cannot be represented. Options:
-* azimuthal Fourier expansion (modes m = 0, ±1, ±2: "2.5D", as in AxiSEM).
-  This also gives dipole and quadrupole sonic-logging sources. It is on the roadmap but not in v1.
-* full 3D (milestone M7).
-
-In v1, microseismic work is therefore done in **2D Cartesian (P–SV)**.
+on-axis sources with axisymmetric radiation: explosion, vertical force, and
+vertical dipole or CLVD. General off-axis moment-tensor events need either an
+azimuthal Fourier extension (modes m = 0, ±1, ±2, which also gives
+dipole sonic sources) or full 3D. In v1, microseismic work is done in **2D
+Cartesian (P–SV)**.
 
 ### 2.5 Later physics (designed for, not built)
 
-* **Attenuation:** standard linear solids with memory variables per GLL point.
-  Adds a state array and a point-wise update, and changes no kernel structure.
-* **Anisotropy:** `C_ij` per GLL point (VTI/TTI are relevant for shale microseismic).
-* **Topography and curved interfaces:** already supported by the geometry
-  (quad9 / higher-order mapping). Only the mesher needs extending.
+* Attenuation: standard linear solids with memory variables per GLL point.
+* Anisotropy: a full C_ij per GLL point (VTI/TTI for shale microseismic).
+* Topography and curved interfaces: already supported through curved macro-elements (§6).
 
 ---
 
-## 3. Discretisation
+## 3. Discretisation and time integration
 
-* **Basis:** Lagrange polynomials on Gauss–Lobatto–Legendre (GLL) points,
-  degree N (default **N = 4**, so 5×5 points per element). GLJ is used on
-  axial elements (§2.4).
-* **Quadrature:** collocated GLL, which gives a **diagonal mass matrix**, so explicit time stepping needs no linear solve.
-* **Kernels:** tensor-product sum factorisation, with derivative matrices
-  `hprime[N+1][N+1]`. N is a **compile-time template parameter**, so loops are fully
-  unrolled on both CPU and GPU. We instantiate N = 2…8.
-* **Geometry:** isoparametric mapping from 4-node (bilinear) or 9-node
-  (quadratic, curved) control points. ∂ξ/∂x and the Jacobian are precomputed
-  per GLL point.
-* **Assembly:** local→global index map (`ibool[e][i][j]`); assembled fields
-  live on unique global points. Material properties are stored **per GLL point**,
-  so smooth heterogeneity inside an element is allowed.
-* **Resolution rule:** about 5 GLL points per minimum wavelength. For N = 4 that
-  means element size h ≲ 0.8 λ_min, where λ_min = v_min / f_max (v_min is the
-  slowest wave: S in solids, P in fluids).
-* **Time stepping:** explicit Newmark (β = 0, γ = ½), which is second-order
-  central difference. Δt = C · min(Δx_GLL / v_p), with C ≈ 0.5 in 2D. The code
-  computes Δt automatically and can check a user-supplied value. LDDRK4-6 can be
-  added later if C-PML needs it.
+### 3.1 Space
 
-**Borehole multiscale issue:** a borehole radius (~0.1 m) is far smaller than
-the formation wavelengths at logging frequencies (~0.3–3 m at 1–20 kHz).
-The tiny elements near the hole set Δt for the whole model. Mitigations, in order:
-radial grading in the mesher (v1), then doubling layers, then local time stepping (future).
+* **Basis:** Lagrange polynomials on GLL points, degree N (default **N = 4**).
+  GLJ(0,1) is used in r on axial elements.
+* **Quadrature:** collocated, which gives a diagonal element mass matrix. Hanging
+  nodes need care (§6.3).
+* **Kernels:** tensor-product sum factorisation with a 1D derivative matrix
+  **D** of size (N+1)×(N+1). N is a compile-time template parameter (instantiated for N = 2…8).
+* **Geometry kinds,** each with its own block type:
+  * `rect`: axis-aligned rectangles. The metric is two scalars per element, and
+    most quadtree leaves in layered and borehole models are this kind, so it is
+    the fast path.
+  * `affine`: parallelograms. One constant 2×2 metric per element.
+  * `curved`: a per-point metric precomputed from the parent macro-element's
+    mapping (bilinear or quadratic).
+  * `axisym-*`: the variants above with an r weight, and GLJ on the axis.
+
+  Storing the metric only where it varies cuts memory traffic, which is the
+  real bottleneck of SEM kernels on both CPU and GPU.
+* **Materials** are sampled at GLL points at load time from a material model
+  (layers, gradients, gridded volumes). The case file stores the model, not
+  per-point arrays.
+* **Resolution rule:** about 5 GLL points per minimum wavelength, so h ≲ N·λ_min/5.
+  This is the refinement criterion the mesher uses (§6).
+
+### 3.2 Time
+
+* `TimeIntegrator` interface acting on a semi-discrete coupled system
+  `M ẍ = R(x, ẋ, t)`. The system object owns the physics ordering (§2.3) and the
+  constraints (§6.3).
+* **v1:** explicit central difference (leapfrog), with Δt from a per-element CFL estimate.
+* **Later:** low-storage Runge–Kutta (LDDRK) for C-PML auxiliary equations.
+* **Local time stepping (planned).** Each element gets a level ℓ with
+  Δt_ℓ = Δt₀ / 2^ℓ from its own CFL limit. The integrator is the leapfrog-based
+  multi-rate scheme of Diaz & Grote (2009), which is explicit and conserves a
+  discrete energy. This fixes the borehole bottleneck: tiny elements at the
+  borehole wall no longer dictate Δt for the whole formation. The level
+  structure lines up with quadtree depth, and element blocks are also split by
+  LTS level so each level's update is one batched kernel launch.
 
 ---
 
 ## 4. Boundaries
 
-| Boundary | Elastic | Acoustic |
+| Boundary | Elastic | Acoustic (pressure) |
 |---|---|---|
-| Free / pressure-release | natural (t = 0) | Dirichlet χ = 0 |
-| Rigid | Dirichlet u = 0 | natural (n·u = 0) |
-| Stacey (v1) | t = −ρ[c_p (v·n)n + c_s (v − (v·n)n)] | n·u = −χ̇ / (ρc) |
-| C-PML (M6) | ADE/convolutional memory variables in a layer of elements | same |
+| Free / pressure-release | natural (t = 0) | Dirichlet p = 0 |
+| Rigid | Dirichlet u = 0 | natural (n·∇p = 0) |
+| Stacey (v1) | t = −ρ[c_p (v·n)n + c_s (v − (v·n)n)] | n·∇p = −ṗ / c, giving boundary term −∮ w ṗ/(ρc) |
+| C-PML (M6) | auxiliary-field layer, element blocks of PML kind | same |
 | Axis (axisym) | u_r = 0 + GLJ quadrature | GLJ quadrature |
 
-Boundaries are stored as edge lists tagged by type. The mesher tags them
-automatically, and Gmsh *physical groups* map to the same tags.
+Boundaries are face sets tagged on the macro-mesh. Refined leaves inherit the tags.
 
 ---
 
-## 5. Sources and receivers
+## 5. Sources and observers
 
-All are located at **arbitrary positions**, not snapped to GLL points. Each
-one is found by an inverse map (Newton iteration in reference coordinates) and
-then evaluated with Lagrange interpolation, or with its derivative for
-moment tensors and strain.
+Everything that injects into the system is a **Forcing**. Everything that reads
+from the system is an **Observer**. Both are located at arbitrary positions:
+an inverse map gives the reference coordinates, and Lagrange interpolation (or
+its derivative) gives the weights.
 
-**Sources**
-* Point force (solid), and a **moment tensor** (solid) for microseismic events.
-  In 2D Cartesian this uses M_xx, M_zz and M_xz. In axisymmetric mode only the
-  on-axis axisymmetric components are allowed (§2.4).
-* Pressure / volume-injection monopole (fluid). This is the borehole sonic source.
-* Source time functions: Ricker, Gaussian and its derivatives, a smoothed
-  Heaviside, or a user-supplied array (resampled to Δt).
-* Many simultaneous sources are allowed (multi-event microseismic catalogues,
-  noise studies).
+**Forcings**
+* Point force and **moment tensor** (solid) for microseismic. 2D Cartesian
+  uses M_xx, M_zz and M_xz; axisymmetric mode allows on-axis axisymmetric parts only.
+* Volume-injection monopole (fluid) for borehole sonic sources (§2.2).
+* Source time functions: Ricker, Gaussian and derivatives, smoothed step, or a user array.
+* Any number of sources, for multi-event microseismic catalogues.
 
-**Receivers (point)**
-* Solid: displacement, velocity, acceleration. Fluid: pressure (−χ̈), and
-  particle displacement or velocity (∇χ/ρ).
-* Receivers whose location is on a fluid–solid interface must say which side they record.
+**Observers** (a common interface: `prepare`, `record(step)`, `flush`)
+* Point receivers. Solid: u, v, a. Fluid: p, and particle velocity
+  (§2.2). A receiver placed exactly on an interface must say which side it records.
+* **DAS fibers.** A polyline (a 3D curve later) with channel spacing and gauge
+  length L. Output is axial strain or strain rate, either point-wise
+  **t**·ε·**t** or gauge-averaged [**u**(s+L/2) − **u**(s−L/2)]·**t** / L (the
+  default). The averaging is done on the fly.
+* Snapshots (decimated) and an **energy monitor** (kinetic + strain + acoustic
+  energy). The energy monitor is a standard stability and diagnostic tool.
 
-**DAS (distributed acoustic sensing)**
-* A fiber is a polyline (2D now, 3D curve later) with channel spacing Δs and gauge length L.
-* Output: axial strain or strain rate, either point-wise ε_tt = **t**·ε·**t**
-  or gauge-averaged [**u**(s+L/2) − **u**(s−L/2)]·**t** / L (the default, which matches
-  real interrogators). The averaging is done in the solver at every step, so
-  the full wavefield is never stored.
-* A fiber inside a fluid-filled borehole is an open modelling question (see §10).
-
-Recording happens on the device (GPU) into a buffer. The buffer is copied
-to the host in chunks every K steps.
+Observers record into device-side buffers that are flushed to the host every K steps.
 
 ---
 
-## 6. Meshing
+## 6. Meshing: macro-mesh + forest of quadtrees
 
-### 6.1 In-house structured mesher (Python, v1)
-* **Layered model:** a stack of layers bounded by interfaces z_k(x) (or z_k(r)),
-  each layer with its own material and element count. The interfaces are honoured
-  exactly, so material and fluid–solid boundaries always fall on element edges.
-* **Borehole template (axisymmetric):** fluid column r < a, then optional
-  logging-tool body, casing and cement annuli, then formation layers in z.
-  Radial grading goes from fine at the borehole wall to coarse in the far
-  field, sized by the local λ_min rule.
-* Boundaries are tagged automatically (free surface, absorbing, axis, fluid–solid).
-* Later additions: doubling bricks, topography, 3D extrusion and hex templates.
+### 6.1 Macro-mesh (conforming, coarse)
+The macro-mesh honours geometry. Every material interface, and in particular
+every fluid–solid interface, lies on macro-element faces. Sources of macro-meshes:
+* **In-house templates (Python):** a layered model (layers bounded by z_k(x)
+  or z_k(r)), and a **borehole template** (fluid column r < a, optional tool,
+  casing and cement annuli, then formation layers).
+* **Gmsh import:** `.msh` v4, quad4 and quad9 (hex later), with physical groups
+  mapped to materials and boundary tags.
 
-### 6.2 Gmsh import
-* `.msh` v4 with quad4 and quad9 elements (hex8 and hex27 in 3D later).
-  Physical groups map to materials and boundary tags.
-* Arbitrary geometry is meshed in Gmsh (its quad recombination is robust in
-  2D). We do **not** write a general unstructured quad or hex mesher.
+Macro-elements may be curved. Their mapping is inherited by every child.
 
-### 6.3 Mesh quality checks
-Checks for negative or degenerate Jacobians, skewness, points per wavelength
-per element, and the Δt bound per element (which shows what limits the time step).
+### 6.2 Adaptive refinement (C++ core, exposed to Python)
+* Each macro-element is the root of a quadtree. Leaves are the computational elements.
+* **Refinement criterion:** refine while the leaf violates h ≤ N·λ_min/ppw
+  (λ_min sampled from the material model at the leaf's GLL points). Optional
+  user refinement regions can be added (around sources, receivers, the borehole wall).
+* **Balance:** 2:1 across all faces, including faces between macro-elements, so
+  an edge has at most one hanging level. Fluid–solid faces are refined
+  identically on both sides (§2.3).
+* The result is one generic description: leaf list + per-leaf geometry kind +
+  hanging-face table. Everything downstream (operators, partitioning, LTS
+  levels) consumes it.
+* This replaces hand-built doubling layers. Large velocity contrasts (water vs
+  rock, borehole fluid vs fast formation) are meshed automatically.
+* 3D later: an octree over hex macro-elements, with the same data model.
+
+### 6.3 Hanging nodes in the operators
+* GLL points on the fine side of a coarse–fine face are **constrained**: they
+  are interpolated from the coarse face's GLL points (**u**_h = C **u**_master).
+* The constraints are folded into the **gather/scatter operators** (§7.3).
+  Gather applies C, and scatter applies Cᵀ. The local kernels never know about hanging nodes.
+* **Mass:** the assembled Cᵀ M C is not diagonal on master points of hanging
+  faces. It is row-sum lumped to keep explicit updates. That is a numerical
+  choice and needs verification: measure spurious reflection at refinement
+  interfaces, the convergence rate, and energy behaviour (§9).
+* **Fallback** if the reflection is unacceptable: conforming 2:1 transition
+  templates for the affected faces, which need no hanging nodes. The data model supports both.
+
+### 6.4 Quality and diagnostics
+Checks for Jacobian sign and condition, points per wavelength per leaf, the CFL
+Δt per leaf (and the resulting LTS level histogram), and an estimated
+cost per partition.
 
 ---
 
 ## 7. Software architecture
 
-### 7.1 Data flow: Python front-end, C++ solver
+### 7.1 Library-first run model
 
 ```
- Python (or YAML → Python)                         C++ solver
- ─────────────────────────                         ──────────
- model + mesher / Gmsh ──► Mesh ──► partition ──► simulation database (HDF5)
- sources, receivers, DAS                             │
- run parameters                                      ▼
-                                       sem_solver db.h5  (mpirun, CUDA or CPU)
-                                                     │
-                                                     ▼
-                                              results.h5 ──► Python post-proc,
-                                                             SEG-Y, XDMF/ParaView
+          Python API / YAML                     C++ API
+                 │                                 │
+                 └──────────────┬──────────────────┘
+                                ▼
+                          Simulation
+   ┌─────────┬──────────┬───────┴────┬───────────┬──────────┬──────────┐
+ MacroMesh  Material   Refinement   Forcings   Observers   Integrator  Backend
+ + tags     model      policy                                          (cpu|cuda)
+                                │
+                  sim.save("case.h5") / Simulation::load
+                                ▼
+            insem-run case.h5   (tiny executable: load → partition → run)
 ```
 
-* **Large and HPC runs:** Python writes a self-contained HDF5 database, and the
-  standalone `sem_solver` executable runs it under `mpirun`. No Python is
-  needed on compute nodes.
-* **Small runs and notebooks:** the same C++ library is called in-process
-  through pybind11 (`sim.run()`). Results come back as NumPy arrays without copying.
-* YAML files are parsed in Python only and build the same objects as the API.
+* There is **one object model** in C++, mirrored in Python. Interactive runs call
+  `sim.run()` in-process and get NumPy views of the results.
+* The **case file is a serialisation** of the `Simulation`: macro-mesh,
+  material model, refinement policy, forcings, observers and run parameters. It
+  is independent of the rank count, backend and N. Refinement, material
+  sampling and partitioning all happen at load time, on the actual parallel layout.
+* `insem-run` contains no logic of its own: it calls `Simulation::load(...).run()`
+  under `mpirun`. Compute nodes need no Python.
 
 ### 7.2 Repository layout (proposed)
 
 ```
-cpp/
-  include/sem/
-    core/        types.hpp (real_t, index), config, error handling
-    basis/       gll.hpp, glj.hpp, lagrange.hpp        (host only)
-    mesh/        mesh.hpp, geometry.hpp, numbering.hpp
-    physics/     pointwise.hpp  ← shared SEM_HD inline physics (CPU+CUDA)
-                 elastic.hpp, acoustic.hpp, coupling.hpp, stacey.hpp
-    sources/     source.hpp, stf.hpp
-    receivers/   receiver.hpp, das.hpp
-    solver/      solver.hpp, newmark.hpp, backend.hpp (interface)
-    io/          hdf5_db.hpp, hdf5_out.hpp
-    parallel/    mpi_comm.hpp, halo.hpp
-  src/
-    cpu/         OpenMP kernels
-    cuda/        .cu kernels
-    ...
-  apps/sem_solver.cpp
-python/insem/    mesher/, gmsh_io, model, sources, receivers, das, yaml_cfg,
-                 database writer, postproc (segy, xdmf), _core (pybind11)
-tests/cpp/       Catch2 unit tests
-tests/python/    pytest: verification against analytic solutions
-examples/        borehole_monopole/, microseismic_2d/, das_vsp/
-docs/
+cpp/include/insem/
+  basis/        gll, glj, lagrange, derivative matrices
+  geometry/     mappings, geometry kinds, inverse map
+  mesh/         macro_mesh, forest (quadtree), balance, constraints, tags
+  model/        material models, sampling
+  ops/          dof_map (gather/scatter incl. constraints), element blocks,
+                operator interface
+  physics/      pointwise.hpp  ← shared HD-inline physics (CPU + CUDA)
+                elastic, acoustic, coupling, stacey
+  forcing/      point force, moment tensor, monopole, STFs
+  observe/      receivers, das, snapshots, energy
+  time/         integrator interface, leapfrog, (lts, lddrk later)
+  parallel/     sfc partition, halo exchange
+  io/           case file, results file (HDF5)
+  sim/          Simulation
+cpp/src/{cpu,cuda,...}
+cpp/apps/insem_run.cpp
+python/insem/   api mirror, templates (layered, borehole), gmsh_io, yaml,
+                postproc (segy, xdmf), plotting
+tests/{cpp,python}   examples/   docs/
 ```
 
-The package name `insem` is a placeholder (see §10).
+`insem` is a placeholder name.
 
-### 7.3 Backend design: native CUDA alongside CPU
+### 7.3 Operators: element blocks + deterministic gather/scatter
 
-You chose two code paths. The risk with two paths is drift, so the design
-keeps the duplicated part as small as possible:
+Applying the stiffness/coupled operator:
+```
+for each element block B (homogeneous: physics × geometry kind × N × LTS level):
+    x_e  = gather_B(x)            # element-local copies, applies hanging constraints C
+    f_e  = kernel_B(x_e)          # sum-factorised local operator, no branching
+f = scatter(f_e over all blocks)  # Cᵀ, transpose of gather
+```
+* **Blocks are homogeneous,** so each kernel is a template instantiation with
+  no runtime branching. This is what makes adding axisymmetric, PML,
+  attenuation or 3D blocks additive rather than invasive.
+* **Deterministic scatter.** The transpose map (for each global point, the
+  ordered list of contributing element-local slots and constraint weights) is
+  precomputed as a CSR table. The scatter is one pass over global points,
+  summing in that fixed order: one CPU thread or one GPU thread per point, and
+  **no atomics, no colouring**. The cost is storing the element-local force
+  array, about 1.5× the global array for N = 4 in 2D. That is acceptable.
+* **Reproducibility:**
+  * Each backend is always run-to-run deterministic, independent of thread or block counts.
+  * In a `strict` build (FMA contraction disabled on both compilers, identical
+    loop order in kernels), **CPU and CUDA are bitwise identical**. CPU-vs-CUDA
+    tests then compare exactly, which is the strongest guard against the two
+    code paths drifting apart.
+  * In normal builds the comparison uses a tolerance.
+* **Shared point-wise physics.** Everything at a single point (stress, traction,
+  coupling, Stacey, interpolation weights, DAS projection) is in
+  `physics/pointwise.hpp` as `INSEM_HD inline` functions. Both backends call
+  these. The two code paths differ only in loop and thread mapping.
+* **CUDA mapping:** several elements per thread block, one thread per point, and
+  **D** in shared memory. `rect` and `affine` blocks read almost no geometry
+  data, which helps bandwidth.
 
-* **Shared point-wise physics.** Everything that happens at a single GLL point
-  (strain → stress, Stacey traction, coupling term, source and receiver
-  interpolation weights, DAS projection) lives in `physics/pointwise.hpp` as
-  `SEM_HD inline` functions (`__host__ __device__` under nvcc, plain `inline`
-  otherwise). Both backends call the same functions.
-* **Duplicated part:** only the loop and thread mapping, and the scatter-add.
-  * CPU: OpenMP over **coloured** element sets, so the global assembly needs no atomics. SIMD comes from the compile-time N.
-  * CUDA: one thread per GLL point, several elements per block (5×5 = 25
-    points is too small for one block). Derivative matrices are in shared or
-    constant memory, and assembly uses `atomicAdd`, with colouring available as a fallback.
-* **One data layout** for both: structure-of-arrays, element-contiguous
-  `[nspec][N+1][N+1]` for geometry and material, and `[nglob]` per component
-  for fields. The CPU layout is exactly what gets uploaded to the GPU.
-* `Backend` interface: `compute_forces_acoustic`, `compute_forces_elastic`,
-  `couple_fluid_solid`, `apply_stacey`, `add_sources`, `record`,
-  `update_newmark`, `pack_halo` / `unpack_halo`. `CpuBackend` and `CudaBackend` implement it.
-* **Equivalence tests:** every physics test runs on both backends, and the
-  CUDA results must match the CPU results within a float tolerance. These tests
-  run on your GPU machines; this development container has no GPU or `nvcc`.
-
-### 7.4 MPI
-
-* Partitioning happens in Python before the run. Options are METIS (via
-  pymetis) and a simple geometric fallback, which keeps C++ dependencies small.
-* Each rank owns its elements. Global points shared between ranks are listed
-  per neighbour, and their contributions are **summed** across ranks after
-  each force computation (classic SEM assembly).
-* Communication overlaps with computation: outer elements → post non-blocking
-  send/recv → inner elements → wait → unpack.
-* GPU halos are packed on the device. CUDA-aware MPI is used when available,
-  otherwise the halos are staged through pinned host buffers.
-* Fluid–solid interfaces and receivers may cross partition boundaries. Each
-  receiver is owned by exactly one rank.
+### 7.4 MPI and partitioning
+* **Space-filling-curve partitioning** of the forest leaves (Morton or
+  Hilbert order across macro-elements), weighted by per-leaf cost (physics,
+  N, and LTS level × substeps). This needs no graph-partitioner dependency and
+  gives contiguous, cache-friendly local orderings. Repartitioning is cheap.
+* Shared global points are summed across ranks after the local scatter. The
+  inner/outer split overlaps communication with computation.
+* For GPUs, halo packing happens on the device, with CUDA-aware MPI when
+  available and staging through pinned host buffers otherwise.
+* Observers belong to the rank that owns their element. Fluid–solid interfaces
+  may cross ranks.
 
 ### 7.5 Build and dependencies
-
-* CMake ≥ 3.24 with options `SEM_ENABLE_CUDA`, `SEM_ENABLE_MPI`,
-  `SEM_ENABLE_OPENMP` and `SEM_REAL=float|double`, plus a list of N values to instantiate.
-* Required: HDF5 (C API; parallel HDF5 when MPI is on).
-* Optional: CUDA ≥ 12, MPI.
-* Python: pybind11, numpy, h5py, pyyaml, optional gmsh and pymetis. Built with scikit-build-core.
-* Tests: Catch2 (C++) and pytest (Python). CI here covers the CPU builds only.
+* CMake with `INSEM_ENABLE_CUDA`, `INSEM_ENABLE_MPI`, `INSEM_ENABLE_OPENMP`,
+  `INSEM_REAL`, `INSEM_STRICT_FP`, and the instantiated N list.
+* Required: HDF5. Optional: CUDA ≥ 12, MPI. No partitioner and no mesh library is required.
+* Python: pybind11, numpy, h5py, pyyaml, optional gmsh. Built with scikit-build-core.
+* Tests: Catch2 and pytest. CI here is CPU only; CUDA and MPI tests run on your hardware.
 
 ---
 
@@ -327,57 +389,50 @@ keeps the duplicated part as small as possible:
 
 HDF5 `results.h5`:
 ```
-/meta               run parameters, dt, nt, units, code version, git hash
-/receivers/<net.sta>/{displacement|velocity|acceleration|pressure}  [nt, ncomp]
-/receivers/<net.sta>@{position, medium, component names}
-/das/<fiber>/{strain|strain_rate} [nt, nchannels]
-/das/<fiber>@{gauge_length, channel_positions, tangents}
-/snapshots/<field>/<step>  (optional, decimated in time and space)
+/meta                    run parameters, dt, nt, units, version, git hash, case hash
+/receivers/<name>/<quantity>          [nt, ncomp]   (+ position, medium, components)
+/das/<fiber>/{strain|strain_rate}     [nt, nchannels] (+ gauge length, positions, tangents)
+/energy                               [nt_energy, {kinetic, elastic, acoustic}]
+/snapshots/<field>/<step>             (optional, decimated)
 ```
-* SEG-Y rev 2 export for receiver gathers and DAS (one trace per channel).
-* XDMF sidecar files over the HDF5 snapshots, so ParaView opens them directly.
+* SEG-Y rev 2 export (receiver gathers, DAS channels).
+* XDMF sidecar files over the snapshots for ParaView, written as leaf-level
+  high-order cells subdivided for display.
 
 ---
 
 ## 9. Verification plan
 
-Physics is not considered done until it passes these tests.
-
 | Test | Reference |
 |---|---|
 | GLL/GLJ points, weights, derivative matrices | closed forms / high-precision tables |
-| 2D homogeneous acoustic, point source | analytic 2D Green's function convolved with the STF |
-| 2D homogeneous elastic, point force / moment tensor | analytic 2D elastic Green's function |
-| Lamb's problem (free surface, Rayleigh wave) | Garvin / Lamb analytic |
-| Fluid–solid interface (reflection, Scholte wave) | Gar6more2D (open-source analytic code) |
-| Spectral convergence: error vs N and h | expected exponential and algebraic rates |
-| Energy conservation (closed box, rigid/free) | total energy constant to round-off |
-| Stacey reflection strength vs incidence angle | measured against a larger reference domain |
-| Axisym homogeneous fluid / solid point source on axis | analytic 3D spherical-wave solutions |
-| Borehole monopole (Stoneley, head waves) | discrete-wavenumber method (DWM) reference in Python (Tsang & Rader 1979) |
-| DAS gauge-length response | strain computed from analytic displacement |
-| CUDA vs CPU, 1 rank vs N ranks | bitwise or tolerance equivalence |
+| Gather/scatter: Cᵀ is the exact transpose of C; constraints reproduce polynomials | algebraic identity tests |
+| 2D homogeneous acoustic (pressure), point source | analytic 2D Green's function ⊛ STF |
+| 2D homogeneous elastic, force / moment tensor | analytic 2D elastic Green's function |
+| Lamb's problem | Garvin / Lamb analytic |
+| Fluid–solid interface (reflection, Scholte wave) | analytic plane-wave coefficients; Gar6more2D as black box |
+| Spectral convergence (N, h), conforming **and** refined meshes | expected rates |
+| Spurious reflection at refinement interfaces (hanging nodes) | must stay below a set threshold (e.g. −60 dB at 5 ppw) |
+| Energy conservation, closed box, with and without LTS | constant to round-off (leapfrog / Diaz–Grote energy) |
+| Stacey reflection vs incidence angle | larger-domain reference |
+| Axisym point sources on axis | analytic 3D spherical waves |
+| Borehole monopole (Stoneley, head waves) | in-house discrete-wavenumber reference (Tsang & Rader 1979) |
+| DAS gauge-length response | strain from analytic displacement |
+| CPU vs CUDA (strict build), 1 vs N ranks | **bitwise** identical |
 
 ---
 
 ## 10. Open questions for review
 
-1. **Name.** The package and namespace name (`insem` is a placeholder).
-2. **Typical problem scales.** Frequencies (sonic logging is about 1–20 kHz;
-   microseismic is about 10–500 Hz), domain sizes, and run lengths. These set
-   memory and compute targets and tell us how urgent MPI is for 2D.
-3. **Borehole geometry detail.** Do you need the logging-tool body, casing and
-   cement in v1, or just a fluid column in the formation?
-4. **DAS in boreholes.** Is the fiber cemented behind casing (it records the
-   solid's strain) or in the fluid? The default proposal is to attach the
-   fiber to the solid medium it sits in.
-5. **Microseismic in 2D.** Is 2D Cartesian P–SV acceptable for v1 microseismic
-   studies, or should azimuthal Fourier (2.5D) or 3D move earlier in the roadmap?
-6. **Target hardware.** GPU models or compute capability, MPI implementation,
-   and whether CUDA-aware MPI is available. Is there any GPU CI runner?
-7. **Licensing and dependencies.** Is any open-source licence acceptable for
-   dependencies (all proposed ones are BSD, MIT or Apache)?
-8. **Gmsh at runtime.** Is the Gmsh Python package acceptable, or should we read `.msh` files only?
+1. **Name** of the package and namespace (`insem` is a placeholder).
+2. **Typical scales:** frequencies (sonic logging is about 1–20 kHz; microseismic
+   is about 10–500 Hz), domain sizes, and run lengths.
+3. **Borehole detail in v1:** do you need the tool body, casing and cement, or only a fluid column?
+4. **DAS placement:** is the fiber cemented behind casing (solid strain) or in the fluid?
+5. **Microseismic in 2D:** is 2D Cartesian P–SV acceptable for v1, or should azimuthal Fourier (2.5D) or 3D come earlier?
+6. **Hardware:** GPU models or compute capability, MPI implementation, CUDA-aware MPI, and whether a GPU CI runner is available.
+7. **Dependencies:** confirm permissive-only (BSD, MIT, Apache; LGPL linked dynamically).
+8. **Gmsh:** is the Gmsh Python package acceptable at runtime, or should we only read `.msh` files?
 
 ---
 
@@ -385,15 +440,16 @@ Physics is not considered done until it passes these tests.
 
 | Milestone | Content | Verified by |
 |---|---|---|
-| **M0** Skeleton | CMake, scikit-build packaging, CI (CPU), GLL/GLJ basis, mesh data structures, HDF5 database I/O | unit tests |
-| **M1** 2D Cartesian core (CPU) | acoustic + elastic, structured layered mesher, Stacey, free/rigid boundaries, point force / MT / pressure sources, point receivers, HDF5 output, OpenMP | analytic 2D, Lamb, convergence, energy |
-| **M2** Coupling + I/O | fluid–solid coupling, Gmsh import, DAS fibers, SEG-Y/XDMF export, YAML front-end | Gar6more2D, DAS analytic |
-| **M3** Axisymmetric | GLJ axis elements, axisym acoustic, elastic and coupling, borehole mesher with radial grading, monopole source | 3D analytic on axis, DWM borehole |
-| **M4** CUDA backend | all M1–M3 physics on GPU, device-side recording | CPU/GPU equivalence + performance |
-| **M5** MPI | partitioning, halo exchange (CPU and CUDA, CUDA-aware), distributed recording | 1-vs-N-rank equivalence, scaling |
-| **M6** C-PML | elastic + acoustic + coupled corners | reflection vs Stacey |
-| **M7** 3D | hex elements, 3D mesher/extrusion, Gmsh hex import, 3D microseismic with borehole arrays and 3D fibers | 3D analytic, Lamb 3D |
-| Later | attenuation, anisotropy (VTI/TTI), topography, 2.5D azimuthal Fourier (dipole logging), doubling layers, local time stepping, adjoint (microseismic location and inversion) | |
+| **M0** Foundations | CMake + scikit-build, CI (CPU), GLL/GLJ basis, macro-mesh + forest data model, dof map / gather–scatter (conforming), `Simulation` skeleton, HDF5 case and results I/O | unit tests |
+| **M1** 2D Cartesian core (CPU) | elastic + acoustic (pressure) element blocks (`rect`, `affine`, `curved`), leapfrog, Stacey, free/rigid boundaries, forcings, point receivers, energy monitor, layered template, OpenMP | analytic 2D, Lamb, convergence, energy |
+| **M2** Coupling + refinement | fluid–solid coupling, quadtree refinement + 2:1 balance + hanging-node constraints, Gmsh import, DAS, SEG-Y/XDMF, YAML | Scholte/reflection, refinement-interface reflection, DAS analytic |
+| **M3** Axisymmetric | axisym geometry kinds (GLJ axis), borehole template, monopole source | 3D analytic on axis, DWM borehole |
+| **M4** CUDA backend | all M1–M3 blocks + gather/scatter + observers on GPU, strict-FP mode | bitwise CPU/CUDA equivalence, performance |
+| **M5** MPI | SFC partitioning, halo exchange (CPU and CUDA), distributed observers, parallel HDF5 | 1-vs-N-rank bitwise, scaling |
+| **M6** C-PML | PML element blocks, LDDRK integrator | reflection vs Stacey |
+| **M7** Local time stepping | Diaz–Grote multi-rate leapfrog, LTS-level blocks, cost-weighted partitioning | energy conservation, accuracy vs global Δt, speed-up on borehole cases |
+| **M8** 3D | hex blocks, octree forest, 3D templates, Gmsh hex import, 3D microseismic + 3D fibers | 3D analytic, Lamb 3D |
+| Later | attenuation, anisotropy, topography, 2.5D azimuthal Fourier (dipole logging), adjoint (microseismic location and inversion) | |
 
-M1–M3 are mostly CPU work and can be developed and tested fully in this
-environment. M4 and M5 need your GPU and MPI hardware for final validation.
+M0–M3 can be developed and fully verified in this environment (CPU). M4 and
+M5 need your GPU and MPI hardware for final validation.
