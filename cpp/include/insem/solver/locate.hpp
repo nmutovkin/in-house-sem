@@ -34,5 +34,8 @@ struct PointWeights {
 };
 PointWeights point_weights(const mesh::Forest& forest, const basis::LagrangeBasis& basis,
                            const PointLocation& loc);
+// Same with different bases along xi and eta (axial leaves use GLJ along xi).
+PointWeights point_weights(const mesh::Forest& forest, const basis::LagrangeBasis& basis_xi,
+                           const basis::LagrangeBasis& basis_eta, const PointLocation& loc);
 
 }  // namespace insem::solver

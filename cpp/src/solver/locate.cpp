@@ -44,11 +44,16 @@ std::optional<PointLocation> locate(const mesh::Forest& forest, const geometry::
 
 PointWeights point_weights(const mesh::Forest& forest, const basis::LagrangeBasis& basis,
                            const PointLocation& loc) {
-  const int n = basis.size();
-  const auto lx = basis.values(loc.xi);
-  const auto ly = basis.values(loc.eta);
-  const auto dlx = basis.derivatives(loc.xi);
-  const auto dly = basis.derivatives(loc.eta);
+  return point_weights(forest, basis, basis, loc);
+}
+
+PointWeights point_weights(const mesh::Forest& forest, const basis::LagrangeBasis& basis_xi,
+                           const basis::LagrangeBasis& basis_eta, const PointLocation& loc) {
+  const int n = basis_xi.size();
+  const auto lx = basis_xi.values(loc.xi);
+  const auto ly = basis_eta.values(loc.eta);
+  const auto dlx = basis_xi.derivatives(loc.xi);
+  const auto dly = basis_eta.derivatives(loc.eta);
   const auto j = geometry::leaf_jacobian(forest, loc.leaf, loc.xi, loc.eta);
   const double det = j[0] * j[3] - j[1] * j[2];
   const double xi_x = j[3] / det, xi_z = -j[1] / det, eta_x = -j[2] / det, eta_z = j[0] / det;

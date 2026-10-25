@@ -176,7 +176,8 @@ void Simulation::setup() {
   gll_ = basis::gll(ngll);
   forest_ = build_forest();
   dofs_ = ops::DofMap::build(*forest_, ngll);
-  geometry_ = geometry::compute_geometry(*forest_, gll_->points, gll_->points);
+  // Axial leaves of axisymmetric meshes use GLJ points in the radial direction.
+  geometry_ = geometry::compute_geometry(*forest_, gll_->points, gll_->points, basis::glj01(ngll).points);
 }
 
 void Simulation::require_setup() const {

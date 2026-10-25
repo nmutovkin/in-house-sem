@@ -37,14 +37,26 @@ struct Domain {
   std::vector<index_t> absorbing_points;
   std::vector<real_t> absorbing_coef;
   // Global points with a homogeneous Dirichlet condition (rigid elastic,
-  // pressure-release acoustic).
+  // pressure-release acoustic), and (axisymmetric elastic) points on the
+  // axis, where the radial component vanishes.
   std::vector<index_t> dirichlet_points;
+  std::vector<index_t> axis_points;
 
   std::vector<real_t> u, v, a, f;  // field, its first and second time derivative, force
   std::vector<real_t> u_local, f_local;
   std::vector<double> coords;  // [2][n_global] point coordinates
 
   index_t n_global() const { return dofs.n_global(); }
+
+  // Zeroes the constrained entries of a global field ([comp][n_global]).
+  template <class T>
+  void apply_dirichlet(std::vector<T>& x) const {
+    const std::size_t ng = static_cast<std::size_t>(n_global());
+    for (int c = 0; c < ncomp; ++c) {
+      for (index_t g : dirichlet_points) x[c * ng + g] = 0;
+    }
+    for (index_t g : axis_points) x[g] = 0;
+  }
 };
 
 // Inputs of the solver (owned by the Simulation).
@@ -169,8 +181,15 @@ class Solver {
   void record();
   void record_snapshot();
 
+  // Quadrature weight x surface Jacobian (x r in axisymmetric mode) and the
+  // outward normal at local point (i, j) of face f of a leaf.
+  void face_weight(const Problem& p, index_t leaf, int f, int i, int j, double& w, double& nx, double& nz) const;
+  // Interpolation weights of a located point (GLJ basis along xi in axial leaves).
   physics::KernelBasis kernel_basis_;
   basis::LagrangeBasis lagrange_;
+  basis::Rule glj_;
+  basis::LagrangeBasis lagrange_glj_;
+  bool axisym_ = false;
   std::vector<Domain> domains_;
   std::vector<SourceTerm> sources_;
   std::vector<ReceiverTerm> receivers_;

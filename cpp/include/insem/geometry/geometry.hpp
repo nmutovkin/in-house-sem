@@ -18,6 +18,7 @@ enum class GeometryKind : std::uint8_t {
   Rect = 0,    // axis-aligned rectangle: x depends on xi only, z on eta only
   Affine = 1,  // parallelogram: constant Jacobian
   Curved = 2,  // general isoparametric mapping: per-point metric
+  Axisym = 3,  // axisymmetric (r, z): per-point metric and r-weighted quadrature (blocks only)
 };
 
 std::string to_string(GeometryKind kind);
@@ -47,6 +48,11 @@ std::array<double, 4> leaf_jacobian(const mesh::Forest& forest, index_t leaf, do
 // ngll entries.
 Geometry compute_geometry(const mesh::Forest& forest, const std::vector<double>& ref_xi,
                           const std::vector<double>& ref_eta);
+
+// Same, with axial leaves of an axisymmetric mesh (Forest::is_axial) using
+// `axial_xi` (the GLJ points) in the xi direction.
+Geometry compute_geometry(const mesh::Forest& forest, const std::vector<double>& ref_xi,
+                          const std::vector<double>& ref_eta, const std::vector<double>& axial_xi);
 
 // Coordinates of the unique global points ([0] = x, [1] = z), plus the largest
 // mismatch between element-local copies of the same global point, which must

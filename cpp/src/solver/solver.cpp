@@ -70,9 +70,10 @@ double dot(const std::vector<T>& a, const std::vector<T>& b) {
 
 Solver::Solver(const Problem& p)
     : kernel_basis_(physics::KernelBasis::from_rule(p.gll.points, p.gll.weights)),
-      lagrange_(p.gll.points) {
-  INSEM_CHECK(p.forest.macro().coord_system() == mesh::CoordSystem::Cartesian,
-              "the axisymmetric solver is milestone M3; only Cartesian meshes can be run");
+      lagrange_(p.gll.points),
+      glj_(basis::glj01(p.gll.size())),
+      lagrange_glj_(glj_.points),
+      axisym_(p.forest.macro().coord_system() == mesh::CoordSystem::Axisymmetric) {
   INSEM_CHECK(p.gll.size() >= physics::kMinNgll && p.gll.size() <= physics::kMaxNgll,
               "polynomial order " << p.gll.size() - 1 << " is not supported by the kernels (1.."
                                   << physics::kMaxNgll - 1 << ")");
@@ -143,15 +144,42 @@ void Solver::build_domains(const Problem& p) {
     if (d.leaves.empty()) continue;
     d.dofs = ops::DofMap::build(p.forest, ngll, d.leaves);
 
-    // Per-point material coefficients and mass density.
+    // Per-point quadrature weights. Axisymmetric: weight x J x r, where
+    // axial elements integrate r with the GLJ rule along xi:
+    //   int f r dxi = int f [r / (1 + xi)] (1 + xi) dxi ~ sum_i w^J_i f_i rt_i,
+    // rt_i = r_i / (1 + xi_i), and on the axis rt = dr/dxi (its limit). The
+    // hoop term carries weight x J (= wr / r off the axis).
     const std::size_t nl = d.leaves.size() * npe;
+    std::vector<double> wr(nl), hoop(nl, 0.0);
+    std::vector<char> axial(d.leaves.size(), 0);
+    for (std::size_t e = 0; e < d.leaves.size(); ++e) {
+      const index_t leaf = d.leaves[e];
+      axial[e] = axisym_ && p.forest.is_axial(leaf) ? 1 : 0;
+      for (std::size_t k = 0; k < npe; ++k) {
+        const int i = static_cast<int>(k % ngll), j = static_cast<int>(k / ngll);
+        const std::size_t pt = static_cast<std::size_t>(leaf) * npe + k;
+        const double jac = p.geometry.jac[pt];
+        if (!axisym_) {
+          wr[e * npe + k] = p.gll.weights[i] * p.gll.weights[j] * jac;
+        } else if (!axial[e]) {
+          hoop[e * npe + k] = p.gll.weights[i] * p.gll.weights[j] * jac;
+          wr[e * npe + k] = hoop[e * npe + k] * std::max(p.geometry.x[pt], 0.0);
+        } else {
+          const double x_xi = p.geometry.eta_z[pt] * jac;  // dr/dxi
+          const double rt = i == 0 ? x_xi : p.geometry.x[pt] / (1.0 + glj_.points[i]);
+          wr[e * npe + k] = glj_.weights[i] * p.gll.weights[j] * jac * rt;
+          hoop[e * npe + k] = i == 0 ? 0.0 : wr[e * npe + k] / p.geometry.x[pt];
+        }
+      }
+    }
+
+    // Per-point material coefficients and mass density.
     std::vector<double> coef0(nl), coef1(nl), local_mass(nl);
     for (std::size_t e = 0; e < d.leaves.size(); ++e) {
       const Material& m = material_of_leaf(p, d.leaves[e]);
       for (std::size_t k = 0; k < npe; ++k) {
         const std::size_t q = e * npe + k;
-        const double wj = p.gll.weights[k % ngll] * p.gll.weights[k / ngll] *
-                          p.geometry.jac[static_cast<std::size_t>(d.leaves[e]) * npe + k];
+        const double wj = wr[q];
         if (medium == Medium::Elastic) {
           coef0[q] = m.rho * (m.vp * m.vp - 2.0 * m.vs * m.vs);
           coef1[q] = m.rho * m.vs * m.vs;
@@ -163,12 +191,19 @@ void Solver::build_domains(const Problem& p) {
         }
       }
     }
-    d.blocks = ops::build_blocks(d.leaves, p.geometry, coef0, coef1);
+    if (axisym_) {
+      d.blocks = {ops::build_axisym_block(d.leaves, p.geometry, coef0, coef1, wr, hoop, axial)};
+    } else {
+      d.blocks = ops::build_blocks(d.leaves, p.geometry, coef0, coef1);
+    }
     std::vector<double> mass(d.n_global());
     d.dofs.assemble(local_mass.data(), mass.data(), 1);
     d.mass.assign(mass.begin(), mass.end());
     d.inv_mass.resize(mass.size());
-    for (std::size_t g = 0; g < mass.size(); ++g) d.inv_mass[g] = static_cast<real_t>(1.0 / mass[g]);
+    for (std::size_t g = 0; g < mass.size(); ++g) {
+      INSEM_CHECK(mass[g] > 0.0, "non-positive lumped mass at a global point (degenerate element?)");
+      d.inv_mass[g] = static_cast<real_t>(1.0 / mass[g]);
+    }
 
     const std::size_t ng = static_cast<std::size_t>(d.n_global());
     for (auto* v : {&d.u, &d.v, &d.a, &d.f}) v->assign(d.ncomp * ng, real_t(0));
@@ -181,6 +216,9 @@ void Solver::build_domains(const Problem& p) {
       const std::size_t q = static_cast<std::size_t>(d.leaves[s / npe]) * npe + s % npe;
       d.coords[g] = p.geometry.x[q];
       d.coords[ng + g] = p.geometry.z[q];
+      if (axisym_ && medium == Medium::Elastic && p.geometry.x[q] <= 0.0) {
+        d.axis_points.push_back(static_cast<index_t>(g));  // u_r = 0 on the axis
+      }
     }
     domains_.push_back(std::move(d));
   }
@@ -194,7 +232,6 @@ void Solver::build_boundaries(const Problem& p, Domain& d) {
 
   const int ngll = geom.ngll;
   const int n = ngll - 1;
-  const std::size_t npe = static_cast<std::size_t>(ngll) * ngll;
   std::map<index_t, std::array<double, 3>> absorbing;  // ordered: deterministic
   std::set<index_t> dirichlet;
 
@@ -211,7 +248,11 @@ void Solver::build_boundaries(const Problem& p, Domain& d) {
       if (tag != face_tag.end()) {
         const auto bc = p.boundaries.find(tag->second);
         if (bc != p.boundaries.end()) type = bc->second;
+        INSEM_CHECK(!(macro.is_axis_face(lf.tree, f) && bc != p.boundaries.end()),
+                    "boundary tag " << tag->second << " is on the symmetry axis, which takes no boundary "
+                                    "condition (remove it from the boundary settings)");
       }
+      if (macro.is_axis_face(lf.tree, f)) continue;  // symmetry axis
       const bool is_dirichlet = (d.medium == Medium::Elastic && type == BoundaryType::Rigid) ||
                                 (d.medium == Medium::Acoustic && type == BoundaryType::Free);
       if (type != BoundaryType::Absorbing && !is_dirichlet) continue;
@@ -225,7 +266,7 @@ void Solver::build_boundaries(const Problem& p, Domain& d) {
           continue;
         }
         double w, nx, nz;
-        face_measure(geom, static_cast<std::size_t>(leaf) * npe + k, f, p.gll.weights[q], w, nx, nz);
+        face_weight(p, leaf, f, i, j, w, nx, nz);
         auto& acc = absorbing[g];
         if (d.medium == Medium::Elastic) {
           double cxx, czz, cxz;
@@ -248,6 +289,25 @@ void Solver::build_boundaries(const Problem& p, Domain& d) {
   d.dirichlet_points.assign(dirichlet.begin(), dirichlet.end());
 }
 
+void Solver::face_weight(const Problem& p, index_t leaf, int f, int i, int j, double& w, double& nx,
+                         double& nz) const {
+  const int ngll = p.gll.size();
+  const std::size_t pt = static_cast<std::size_t>(leaf) * ngll * ngll + j * ngll + i;
+  double ds;
+  face_measure(p.geometry, pt, f, 1.0, ds, nx, nz);
+  const bool along_xi = f == 0 || f == 2;
+  if (!axisym_) {
+    w = p.gll.weights[along_xi ? i : j] * ds;
+  } else if (along_xi && p.forest.is_axial(leaf)) {
+    // GLJ rule along a radial face starting on the axis (see build_domains).
+    const double x_xi = p.geometry.eta_z[pt] * p.geometry.jac[pt];
+    const double rt = i == 0 ? x_xi : p.geometry.x[pt] / (1.0 + glj_.points[i]);
+    w = glj_.weights[i] * ds * rt;
+  } else {
+    w = p.gll.weights[along_xi ? i : j] * ds * std::max(p.geometry.x[pt], 0.0);
+  }
+}
+
 void Solver::build_coupling(const Problem& p) {
   const int fi = domain_index(Medium::Acoustic);
   const int si = domain_index(Medium::Elastic);
@@ -256,7 +316,6 @@ void Solver::build_coupling(const Problem& p) {
   const Domain& solid = domains_[si];
   const int ngll = p.gll.size();
   const int n = ngll - 1;
-  const std::size_t npe = static_cast<std::size_t>(ngll) * ngll;
   const mesh::LeafVertices lv = p.forest.leaf_vertices();
   auto edge_key = [](index_t a, index_t b) {
     return (static_cast<std::uint64_t>(std::min(a, b)) << 32) | static_cast<std::uint32_t>(std::max(a, b));
@@ -296,7 +355,7 @@ void Solver::build_coupling(const Problem& p) {
         const index_t gf = fluid.dofs.global_index(static_cast<index_t>(e), k);
         const index_t gs = solid.dofs.global_index(es, js * ngll + is);
         double w, nx, nz;
-        face_measure(p.geometry, static_cast<std::size_t>(leaf) * npe + k, f, p.gll.weights[q], w, nx, nz);
+        face_weight(p, leaf, f, i, j, w, nx, nz);
         auto [entry, inserted] = entries.try_emplace(gf, Entry{gs, 0.0, 0.0});
         INSEM_CHECK(entry->second.solid_point == gs, "inconsistent fluid-solid interface point");
         entry->second.cx += w * nx;
@@ -329,9 +388,22 @@ void Solver::build_sources(const Problem& p) {
     const auto loc = locate(p.forest, p.geometry, src.position, d.leaves);
     INSEM_CHECK(loc, "source " << si << " at (" << src.position[0] << ", " << src.position[1]
                                << ") is not inside the " << to_string(src.medium()) << " part of the model");
-    const PointWeights w = point_weights(p.forest, lagrange_, *loc);
+    const bool axial = axisym_ && p.forest.is_axial(loc->leaf);
+    const PointWeights w = point_weights(p.forest, axial ? lagrange_glj_ : lagrange_, lagrange_, *loc);
     const index_t e = d.element_of_leaf[loc->leaf];
     const int npe = d.dofs.points_per_element();
+    // Axisymmetric: the weak form is per radian, so source strengths are
+    // divided by 2 pi. On the axis this is a 3D point source of the given
+    // strength; off the axis it is a ring source of that total strength.
+    const double scale = axisym_ ? 1.0 / (2.0 * 3.14159265358979323846) : 1.0;
+    const double rs = src.position[0];
+    if (axisym_) {
+      const bool on_axis = std::abs(rs) <= 1e-12 * (1.0 + std::abs(src.position[1]));
+      INSEM_CHECK(!(on_axis && src.kind == Source::Kind::Force && src.components[0] != 0.0),
+                  "source " << si << ": a radial force on the axis is not axisymmetric");
+      INSEM_CHECK(!(on_axis && src.kind == Source::Kind::MomentTensor && src.components[2] != 0.0),
+                  "source " << si << ": an M_rz moment on the axis is not axisymmetric");
+    }
 
     // Force on each local point, then distributed to global points through
     // the slot's constraint row (C^T), accumulated in global order.
@@ -348,14 +420,19 @@ void Solver::build_sources(const Problem& p) {
           // Equivalent body force -div(M delta): f_a(p) = M_ab d_b phi_p(x_s).
           fx = c[0] * w.d_dx[k] + c[2] * w.d_dz[k];
           fz = c[2] * w.d_dx[k] + c[1] * w.d_dz[k];
+          if (axisym_) {
+            // Hoop part M_tt eps_tt(phi), with M_tt = M_rr: phi / r, or
+            // dphi/dr on the axis.
+            fx += c[0] * (rs > 0.0 ? w.value[k] / rs : w.d_dx[k]);
+          }
           break;
         case Source::Kind::Monopole:
           fx = w.value[k];
           break;
       }
       for (const auto& [g, wt] : d.dofs.slot_entries(e, k)) {
-        acc[g][0] += wt * fx;
-        acc[g][1] += wt * fz;
+        acc[g][0] += wt * fx * scale;
+        acc[g][1] += wt * fz * scale;
       }
     }
     SourceTerm term;
@@ -387,7 +464,8 @@ void Solver::build_receivers(const Problem& p) {
                                   << ") is outside the " << (rec.medium.empty() ? "" : rec.medium + " part of the ")
                                   << "model");
     const Domain& d = domains_[term.domain];
-    const PointWeights w = point_weights(p.forest, lagrange_, *loc);
+    const bool axial = axisym_ && p.forest.is_axial(loc->leaf);
+    const PointWeights w = point_weights(p.forest, axial ? lagrange_glj_ : lagrange_, lagrange_, *loc);
     const index_t e = d.element_of_leaf[loc->leaf];
     // Interpolation weights on global points (constrained slots expanded).
     std::map<index_t, std::array<double, 3>> acc;
@@ -443,9 +521,7 @@ double Solver::estimate_stable_dt() {
     std::vector<real_t> x(d.ncomp * ng);
     for (auto& v : x) v = static_cast<real_t>(dist(rng));
     for (int it = 0; it < 100; ++it) {
-      for (int c = 0; c < d.ncomp; ++c) {
-        for (index_t g : d.dirichlet_points) x[c * ng + g] = 0;
-      }
+      d.apply_dirichlet(x);
       const double xkx = -internal_forces(d, x, true);
       double xmx = 0.0, norm = 0.0;
       for (int c = 0; c < d.ncomp; ++c) {
@@ -492,12 +568,7 @@ double Solver::coupled_lambda_max(std::mt19937& rng) {
   };
   double lambda = 0.0;
   for (int it = 0; it < 120; ++it) {
-    for (Domain* d : {&solid, &fluid}) {
-      const std::size_t ng = static_cast<std::size_t>(d->n_global());
-      for (int c = 0; c < d->ncomp; ++c) {
-        for (index_t g : d->dirichlet_points) d->u[c * ng + g] = 0;
-      }
-    }
+    for (Domain* d : {&solid, &fluid}) d->apply_dirichlet(d->u);
     const double nx = mass_norm2(solid, solid.u) + mass_norm2(fluid, fluid.u);
     for (Domain* d : {&solid, &fluid}) {
       internal_forces(*d, d->u, false);
@@ -505,8 +576,8 @@ double Solver::coupled_lambda_max(std::mt19937& rng) {
       const std::size_t ng = static_cast<std::size_t>(d->n_global());
       for (int c = 0; c < d->ncomp; ++c) {
         for (std::size_t g = 0; g < ng; ++g) d->a[c * ng + g] = d->f[c * ng + g] * d->inv_mass[g];
-        for (index_t g : d->dirichlet_points) d->a[c * ng + g] = 0;
       }
+      d->apply_dirichlet(d->a);
     }
     const double ny = mass_norm2(solid, solid.a) + mass_norm2(fluid, fluid.a);
     if (nx <= 0.0 || ny <= 0.0) break;
@@ -611,9 +682,7 @@ void Solver::solve_acceleration(Domain& d, bool damping_implicit) {
       d.a[g] = static_cast<real_t>((d.f[g] - c * d.v[g]) / (d.mass[g] + h * c));
     }
   }
-  for (int c = 0; c < ncomp; ++c) {
-    for (index_t g : d.dirichlet_points) d.a[c * ng + g] = 0;
-  }
+  d.apply_dirichlet(d.a);
 }
 
 void Solver::set_state(Medium medium, const std::vector<double>& u, const std::vector<double>& v) {
@@ -628,10 +697,8 @@ void Solver::set_state(Medium medium, const std::vector<double>& u, const std::v
     d.u[i] = static_cast<real_t>(u[i]);
     d.v[i] = static_cast<real_t>(v[i]);
   }
-  const std::size_t ng = static_cast<std::size_t>(d.n_global());
-  for (int c = 0; c < d.ncomp; ++c) {
-    for (index_t g : d.dirichlet_points) d.u[c * ng + g] = d.v[c * ng + g] = 0;
-  }
+  d.apply_dirichlet(d.u);
+  d.apply_dirichlet(d.v);
 }
 
 void Solver::record() {

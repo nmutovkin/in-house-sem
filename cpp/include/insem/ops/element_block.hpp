@@ -18,12 +18,22 @@ namespace insem::ops {
 // coef0 / coef1: material coefficients per point ([block element][k]):
 //   elastic:  lambda, mu
 //   acoustic: 1 / rho, (unused)
+//
+// Axisym blocks (docs/DESIGN.md §2.4) additionally hold, per point:
+//   wr:    quadrature weight x Jacobian x r (with the GLJ factor on axial
+//          elements, where it stays positive on the axis)
+//   hoop:  wr / r, the weight of the hoop term (unused on the axis)
+//   r:     radius, exactly 0 on the axis
+// and per element `axial` (the element's xi = -1 face is on the axis and
+// its xi direction uses GLJ points). metric is 5 per point, as Curved.
 struct ElementBlock {
   geometry::GeometryKind kind = geometry::GeometryKind::Curved;
   std::vector<index_t> elements;  // domain-local element indices
   std::vector<real_t> metric;
   std::vector<real_t> coef0;
   std::vector<real_t> coef1;
+  std::vector<real_t> wr, hoop, r;
+  std::vector<char> axial;
 
   index_t size() const { return static_cast<index_t>(elements.size()); }
 };
@@ -32,7 +42,14 @@ inline constexpr int metric_stride(geometry::GeometryKind kind) {
   return kind == geometry::GeometryKind::Rect ? 3 : 5;
 }
 
-// Splits a domain into blocks by geometry kind.
+// One Axisym block for all elements of a domain. `wr`, `hoop` and `axial`
+// are per domain element ([e][k] and [e]).
+ElementBlock build_axisym_block(const std::vector<index_t>& leaves, const geometry::Geometry& geom,
+                                const std::vector<double>& coef0, const std::vector<double>& coef1,
+                                const std::vector<double>& wr, const std::vector<double>& hoop,
+                                const std::vector<char>& axial);
+
+// Splits a (Cartesian) domain into blocks by geometry kind.
 //   leaves:    forest leaf of each domain element
 //   geom:      geometry of all forest leaves
 //   coef0/1:   per-point coefficients of the domain elements ([e][k])

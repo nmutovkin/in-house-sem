@@ -87,8 +87,45 @@ MacroMesh::MacroMesh(CellType type, CoordSystem coords, std::vector<double> node
   for (index_t v : cells_) {
     INSEM_CHECK(v >= 0 && v < nn, "cell references node " << v << " outside [0, " << nn << ")");
   }
+  if (coords_ == CoordSystem::Axisymmetric) orient_axis_faces();
   build_topology();
   validate();
+}
+
+bool MacroMesh::is_axis_face(index_t c, int f) const {
+  if (coords_ != CoordSystem::Axisymmetric) return false;
+  double extent = 0.0;
+  for (int k = 0; k < 4; ++k) extent = std::max(extent, std::abs(nodes_[2 * cell_node(c, k) + 1]));
+  for (int k = 0; k < 4; ++k) extent = std::max(extent, std::abs(nodes_[2 * cell_node(c, k)]));
+  const double tol = 1e-10 * std::max(extent, 1e-300);
+  return std::abs(nodes_[2 * cell_node(c, kFaceCorners[f][0])]) <= tol &&
+         std::abs(nodes_[2 * cell_node(c, kFaceCorners[f][1])]) <= tol;
+}
+
+void MacroMesh::orient_axis_faces() {
+  const int npc = nodes_per_cell();
+  for (index_t c = 0; c < n_cells(); ++c) {
+    int axis_face = -1;
+    for (int f = 0; f < 4; ++f) {
+      if (is_axis_face(c, f)) {
+        INSEM_CHECK(axis_face < 0, "cell " << c << " has more than one face on the axis");
+        axis_face = f;
+      }
+    }
+    if (axis_face < 0 || axis_face == 3) continue;
+    // Rotate by k so that old face `axis_face` becomes face 3: new corner i
+    // is old corner (i + k) mod 4, and likewise for the face midpoints.
+    const int k = (axis_face + 1) % 4;
+    index_t* cell = &cells_[static_cast<std::size_t>(c) * npc];
+    std::vector<index_t> old(cell, cell + npc);
+    for (int i = 0; i < 4; ++i) cell[i] = old[(i + k) % 4];
+    if (npc == 9) {
+      for (int i = 0; i < 4; ++i) cell[4 + i] = old[4 + (i + k) % 4];
+    }
+    for (auto& bf : boundary_) {
+      if (bf.cell == c) bf.face = (bf.face - k + 4) % 4;
+    }
+  }
 }
 
 void MacroMesh::build_topology() {

@@ -6,6 +6,7 @@
 #include <cstddef>
 
 #include "insem/basis/lagrange.hpp"
+#include "insem/basis/quadrature.hpp"
 #include "insem/core/error.hpp"
 #include "insem/physics/pointwise.hpp"
 
@@ -156,6 +157,137 @@ void acoustic_kernel(const KernelBasis& kb, const ops::ElementBlock& blk, const 
   }
 }
 
+// ---- axisymmetric (r, z) kernels (docs/DESIGN.md §2.4)
+//
+// Weak form per radian: integrals carry r (folded into wr). Elastic adds the
+// hoop strain u_r / r and stress sigma_tt; on the axis u_r / r -> du_r/dr,
+// and the hoop term's test side uses the same limit, so the operator stays
+// symmetric: at an axis point q the term wr_q sigma_tt dphi_a/dr (q) is
+// spread over the nodes of its row and column.
+
+// Reference derivatives with separate matrices along xi (Dx) and eta (Dy).
+template <int NG>
+inline void reference_derivatives_xy(const real_t* Dx, const real_t* Dy, const real_t* u, int i, int j,
+                                     real_t& u_xi, real_t& u_eta) {
+  real_t a = 0, b = 0;
+  for (int l = 0; l < NG; ++l) {
+    a += Dx[i * NG + l] * u[j * NG + l];
+    b += Dy[j * NG + l] * u[l * NG + i];
+  }
+  u_xi = a;
+  u_eta = b;
+}
+
+template <int NG>
+inline real_t weak_divergence_xy(const real_t* Dx, const real_t* Dy, const real_t* f_xi, const real_t* f_eta,
+                                 int i, int j) {
+  real_t s = 0;
+  for (int l = 0; l < NG; ++l) {
+    s += Dx[l * NG + i] * f_xi[j * NG + l];
+    s += Dy[l * NG + j] * f_eta[l * NG + i];
+  }
+  return s;
+}
+
+template <int NG>
+void elastic_axisym_kernel(const KernelBasis& kb, const ops::ElementBlock& blk, const real_t* u, real_t* f) {
+  constexpr int NPE = NG * NG;
+  const index_t nb = blk.size();
+#pragma omp parallel for schedule(static)
+  for (index_t b = 0; b < nb; ++b) {
+    const std::size_t e = static_cast<std::size_t>(blk.elements[b]);
+    const bool axial = blk.axial[b] != 0;
+    const real_t* Dx = axial ? kb.Dj.data() : kb.D.data();
+    const real_t* Dy = kb.D.data();
+    const real_t* ur = u + e * 2 * NPE;
+    const real_t* uz = ur + NPE;
+    const std::size_t p0 = static_cast<std::size_t>(b) * NPE;
+    const real_t* m = blk.metric.data() + p0 * 5;
+    real_t f1r[NPE], f2r[NPE], f1z[NPE], f2z[NPE], hoop_direct[NPE], axis_g[NG];
+    for (int j = 0; j < NG; ++j) {
+      for (int i = 0; i < NG; ++i) {
+        const int k = j * NG + i;
+        const std::size_t p = p0 + k;
+        real_t ur_xi, ur_eta, uz_xi, uz_eta;
+        reference_derivatives_xy<NG>(Dx, Dy, ur, i, j, ur_xi, ur_eta);
+        reference_derivatives_xy<NG>(Dx, Dy, uz, i, j, uz_xi, uz_eta);
+        const real_t xi_r = m[5 * k], xi_z = m[5 * k + 1], eta_r = m[5 * k + 2], eta_z = m[5 * k + 3];
+        real_t ur_r, ur_z, uz_r, uz_z;
+        physical_gradient(ur_xi, ur_eta, xi_r, xi_z, eta_r, eta_z, ur_r, ur_z);
+        physical_gradient(uz_xi, uz_eta, xi_r, xi_z, eta_r, eta_z, uz_r, uz_z);
+        const real_t r = blk.r[p];
+        const bool on_axis = r == real_t(0);
+        const real_t e_tt = on_axis ? ur_r : ur[k] / r;
+        const real_t lambda = blk.coef0[p], mu = blk.coef1[p];
+        const real_t tr = ur_r + uz_z + e_tt;
+        const real_t srr = lambda * tr + 2 * mu * ur_r;
+        const real_t szz = lambda * tr + 2 * mu * uz_z;
+        const real_t stt = lambda * tr + 2 * mu * e_tt;
+        const real_t srz = mu * (ur_z + uz_r);
+        const real_t w = blk.wr[p];
+        reference_flux(w, srr, srz, xi_r, xi_z, eta_r, eta_z, f1r[k], f2r[k]);
+        reference_flux(w, srz, szz, xi_r, xi_z, eta_r, eta_z, f1z[k], f2z[k]);
+        if (axial && i == 0) {
+          hoop_direct[k] = 0;
+          axis_g[j] = w * stt;
+        } else {
+          hoop_direct[k] = blk.hoop[p] * stt;
+        }
+      }
+    }
+    real_t* fr = f + e * 2 * NPE;
+    real_t* fz = fr + NPE;
+    for (int j = 0; j < NG; ++j) {
+      for (int i = 0; i < NG; ++i) {
+        const int k = j * NG + i;
+        fr[k] = -(weak_divergence_xy<NG>(Dx, Dy, f1r, f2r, i, j) + hoop_direct[k]);
+        fz[k] = -weak_divergence_xy<NG>(Dx, Dy, f1z, f2z, i, j);
+      }
+    }
+    if (axial) {
+      // dphi_a/dr at axis point (0, jq) = xi_r Dx[0][ia] (row jq) + eta_r Dy[jq][ja] (column 0).
+      for (int jq = 0; jq < NG; ++jq) {
+        const int kq = jq * NG;
+        const real_t g = axis_g[jq];
+        const real_t xi_r = m[5 * kq], eta_r = m[5 * kq + 2];
+        for (int ia = 0; ia < NG; ++ia) fr[jq * NG + ia] -= g * xi_r * Dx[ia];
+        for (int ja = 0; ja < NG; ++ja) fr[ja * NG] -= g * eta_r * Dy[jq * NG + ja];
+      }
+    }
+  }
+}
+
+template <int NG>
+void acoustic_axisym_kernel(const KernelBasis& kb, const ops::ElementBlock& blk, const real_t* p_in, real_t* f) {
+  constexpr int NPE = NG * NG;
+  const index_t nb = blk.size();
+#pragma omp parallel for schedule(static)
+  for (index_t b = 0; b < nb; ++b) {
+    const std::size_t e = static_cast<std::size_t>(blk.elements[b]);
+    const real_t* Dx = blk.axial[b] ? kb.Dj.data() : kb.D.data();
+    const real_t* Dy = kb.D.data();
+    const real_t* pe = p_in + e * NPE;
+    const std::size_t p0 = static_cast<std::size_t>(b) * NPE;
+    const real_t* m = blk.metric.data() + p0 * 5;
+    real_t f1[NPE], f2[NPE];
+    for (int j = 0; j < NG; ++j) {
+      for (int i = 0; i < NG; ++i) {
+        const int k = j * NG + i;
+        real_t p_xi, p_eta;
+        reference_derivatives_xy<NG>(Dx, Dy, pe, i, j, p_xi, p_eta);
+        const real_t xi_r = m[5 * k], xi_z = m[5 * k + 1], eta_r = m[5 * k + 2], eta_z = m[5 * k + 3];
+        real_t p_r, p_z;
+        physical_gradient(p_xi, p_eta, xi_r, xi_z, eta_r, eta_z, p_r, p_z);
+        reference_flux(blk.wr[p0 + k] * blk.coef0[p0 + k], p_r, p_z, xi_r, xi_z, eta_r, eta_z, f1[k], f2[k]);
+      }
+    }
+    real_t* fe = f + e * NPE;
+    for (int j = 0; j < NG; ++j) {
+      for (int i = 0; i < NG; ++i) fe[j * NG + i] = -weak_divergence_xy<NG>(Dx, Dy, f1, f2, i, j);
+    }
+  }
+}
+
 using KernelFn = void (*)(const KernelBasis&, const ops::ElementBlock&, const real_t*, real_t*);
 
 template <int NG>
@@ -167,6 +299,8 @@ KernelFn select_kind(bool elastic, GeometryKind kind) {
       return elastic ? &elastic_kernel<NG, GeometryKind::Affine> : &acoustic_kernel<NG, GeometryKind::Affine>;
     case GeometryKind::Curved:
       return elastic ? &elastic_kernel<NG, GeometryKind::Curved> : &acoustic_kernel<NG, GeometryKind::Curved>;
+    case GeometryKind::Axisym:
+      return elastic ? &elastic_axisym_kernel<NG> : &acoustic_axisym_kernel<NG>;
   }
   return nullptr;
 }
@@ -195,6 +329,8 @@ KernelBasis KernelBasis::from_rule(const std::vector<double>& nodes, const std::
   kb.ngll = static_cast<int>(nodes.size());
   const auto d = basis::LagrangeBasis(nodes).derivative_matrix();
   kb.D.assign(d.begin(), d.end());
+  const auto dj = basis::LagrangeBasis(basis::glj01(kb.ngll).points).derivative_matrix();
+  kb.Dj.assign(dj.begin(), dj.end());
   kb.w2.resize(nodes.size() * nodes.size());
   for (int j = 0; j < kb.ngll; ++j) {
     for (int i = 0; i < kb.ngll; ++i) kb.w2[j * kb.ngll + i] = static_cast<real_t>(weights[i] * weights[j]);

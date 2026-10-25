@@ -143,3 +143,49 @@ def lamb_surface(t, stf, x, vp, vs, rho, force=1.0, pad=4):
         ux[i] = np.sum(-1j * k * force * (2 * k * k - ks2 - 2 * nup * nus) / (mu * r) * phase)
     # u(t) = e^{eps t} irfft(conj(U) * spectrum of s e^{-eps t})
     return np.array([(np.exp(eps * tt) * np.fft.irfft(np.conj(u) * sd, m))[:n] for u in (ux, uz)]).T
+
+
+# ------------------------------------------------------------------- 3D
+
+
+def _green3d_scalar(k, r):
+    """g, g', g'' of g = e^{-ikR} / (4 pi R) (numpy convention, outgoing)."""
+    g = np.exp(-1j * k * r) / (4 * np.pi * r)
+    a = -1j * k - 1 / r
+    return g, g * a, g * (a * a + 1 / r**2)
+
+
+def acoustic_pressure_3d(t, stf, r, z, c, rho):
+    """Pressure of a 3D point monopole (1/kappa) p_tt = div(grad p / rho) + stf(t) delta."""
+    R = np.hypot(r, z)
+    return rho * np.interp(t - R / c, t, stf, left=0.0) / (4 * np.pi * R)
+
+
+def elastic_displacement_3d(t, stf, r, z, vp, vs, rho, force_z=None, explosion=None):
+    """(u_r, u_z) at (r, z) for a vertical point force or an isotropic moment
+    tensor (explosion) at the origin of a 3D homogeneous solid.
+
+    G = (1/mu) [g_s I + (1/k_s^2) grad grad (g_s - g_p)]; an explosion of
+    moment M0 radiates u = -M0 grad(g_p) / (rho vp^2).
+    """
+    S, w, npad = _spectrum(t, stf)
+    W = w.copy()
+    W[0] = 1.0
+    R = np.hypot(r, z)
+    e = np.array([r / R, z / R])
+    if force_z is not None:
+        mu = rho * vs * vs
+        gs, gsp, gspp = _green3d_scalar(W / vs, R)
+        gq, gqp, gqpp = _green3d_scalar(W / vp, R)
+        U = []
+        for i in range(2):  # G_iz
+            d = 1.0 if i == 1 else 0.0
+            hs = gspp * e[i] * e[1] + gsp / R * (d - e[i] * e[1])
+            hp = gqpp * e[i] * e[1] + gqp / R * (d - e[i] * e[1])
+            U.append(force_z * (gs * d + (hs - hp) / (W / vs) ** 2) / mu)
+        U = np.array(U)
+    else:
+        _, gqp, _ = _green3d_scalar(W / vp, R)
+        U = np.array([-explosion / (rho * vp**2) * gqp * e[i] for i in range(2)])
+    U[:, 0] = 0.0
+    return np.array([np.fft.irfft(U[i] * S, npad)[: len(t)] for i in range(2)]).T

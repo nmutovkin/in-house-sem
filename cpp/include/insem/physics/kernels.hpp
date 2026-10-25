@@ -16,8 +16,10 @@ struct KernelBasis {
   int ngll = 0;
   std::vector<real_t> D;   // D[i * ngll + l] = l_l'(x_i)
   std::vector<real_t> w2;  // w2[j * ngll + i] = w_i w_j
+  std::vector<real_t> Dj;  // derivative matrix on the GLJ(0,1) points (axial elements)
 
-  // GLL nodes and weights (double) to kernel data (real_t).
+  // GLL nodes and weights (double) to kernel data (real_t); Dj from the
+  // GLJ points of the same size.
   static KernelBasis from_rule(const std::vector<double>& nodes, const std::vector<double>& weights);
 };
 

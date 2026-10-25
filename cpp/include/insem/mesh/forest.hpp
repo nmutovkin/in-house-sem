@@ -95,6 +95,10 @@ class Forest {
 
   int max_level() const;
 
+  // Axisymmetric meshes: the leaf touches the axis with its face 3 (its
+  // xi direction is radial and uses Gauss-Lobatto-Jacobi points).
+  bool is_axial(index_t l) const { return leaves_[l].i == 0 && macro_->touches_axis(leaves_[l].tree); }
+
  private:
   Forest(std::shared_ptr<const MacroMesh> macro, std::vector<Leaf> leaves);
 

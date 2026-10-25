@@ -167,8 +167,12 @@ DofMap DofMap::build(const mesh::Forest& forest, int ngll, const std::vector<ind
   // the coarse face's Lagrange interpolant at the slot's position. Coarse
   // face nodes may themselves be constrained (chains through corners), so
   // rows are resolved recursively.
-  const basis::LagrangeBasis lagrange(basis::gll(ngll).points);
-  const auto& nodes = lagrange.nodes();
+  // Faces along xi of axial elements (axisymmetric meshes) carry GLJ points.
+  const basis::LagrangeBasis gll_basis(basis::gll(ngll).points);
+  const basis::LagrangeBasis glj_basis(basis::glj01(ngll).points);
+  auto face_basis = [&](index_t e, int f) -> const basis::LagrangeBasis& {
+    return (forest.is_axial(leaves[e]) && (f == 0 || f == 2)) ? glj_basis : gll_basis;
+  };
   std::map<std::size_t, Row> memo;
   std::function<Row(std::size_t)> resolve = [&](std::size_t slot) -> Row {
     const index_t m = d.l2g_[slot];
@@ -192,9 +196,9 @@ DofMap DofMap::build(const mesh::Forest& forest, int ngll, const std::vector<ind
     }
     INSEM_CHECK(f >= 0, "constrained point is not on a hanging face");
     const Hang h = hang[e][f];
-    const double t = (f == 0 || f == 2) ? nodes[i] : nodes[j];
+    const double t = face_basis(e, f).nodes()[(f == 0 || f == 2) ? i : j];
     const double tc = forest.face_coordinate(leaves[e], f, t, leaves[h.coarse], h.face);
-    const auto w = lagrange.values(tc);
+    const auto w = face_basis(h.coarse, h.face).values(tc);
     std::map<index_t, double> acc;
     for (int q = 0; q <= n; ++q) {
       if (std::abs(w[q]) < 1e-14) continue;

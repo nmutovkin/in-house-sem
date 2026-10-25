@@ -75,12 +75,20 @@ class MacroMesh {
   std::array<index_t, 2> edge_nodes(index_t e) const { return {edge_nodes_[2 * e], edge_nodes_[2 * e + 1]}; }
   bool is_boundary_edge(index_t e) const { return edge_cells_[2 * e + 1] < 0; }
 
+  // Axisymmetric meshes: true when face f of cell c lies on the symmetry
+  // axis r = 0. The constructor rotates the local numbering of every cell
+  // with an axis face so that this face is face 3 (xi = -1), which is where
+  // the Gauss-Lobatto-Jacobi points of axial elements put the axis.
+  bool is_axis_face(index_t c, int f) const;
+  bool touches_axis(index_t c) const { return is_axis_face(c, 3); }
+
   // Isoparametric mapping of cell c from reference (xi, eta) in [-1, 1]^2.
   std::array<double, 2> map(index_t c, double xi, double eta) const;
   // Jacobian {dx/dxi, dx/deta, dz/dxi, dz/deta} of the mapping.
   std::array<double, 4> jacobian(index_t c, double xi, double eta) const;
 
  private:
+  void orient_axis_faces();
   void build_topology();
   void validate() const;
 

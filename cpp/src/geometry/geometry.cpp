@@ -15,6 +15,8 @@ std::string to_string(GeometryKind kind) {
       return "affine";
     case GeometryKind::Curved:
       return "curved";
+    case GeometryKind::Axisym:
+      return "axisym";
   }
   return "unknown";
 }
@@ -36,11 +38,16 @@ std::array<double, 4> leaf_jacobian(const mesh::Forest& forest, index_t leaf, do
 
 Geometry compute_geometry(const mesh::Forest& forest, const std::vector<double>& ref_xi,
                           const std::vector<double>& ref_eta) {
-  INSEM_CHECK(ref_xi.size() == ref_eta.size() && ref_xi.size() >= 2,
+  return compute_geometry(forest, ref_xi, ref_eta, ref_xi);
+}
+
+Geometry compute_geometry(const mesh::Forest& forest, const std::vector<double>& ref_xi_default,
+                          const std::vector<double>& ref_eta, const std::vector<double>& axial_xi) {
+  INSEM_CHECK(ref_xi_default.size() == ref_eta.size() && axial_xi.size() == ref_eta.size() && ref_eta.size() >= 2,
               "reference point sets must have the same size >= 2");
   const mesh::MacroMesh& macro = forest.macro();
   Geometry g;
-  g.ngll = static_cast<int>(ref_xi.size());
+  g.ngll = static_cast<int>(ref_eta.size());
   g.n_elements = forest.n_leaves();
   const int ngll = g.ngll;
   const std::size_t npe = static_cast<std::size_t>(ngll) * ngll;
@@ -54,6 +61,7 @@ Geometry compute_geometry(const mesh::Forest& forest, const std::vector<double>&
 #pragma omp parallel for schedule(static)
   for (index_t e = 0; e < g.n_elements; ++e) {
     const index_t cell = forest.leaf(e).tree;
+    const std::vector<double>& ref_xi = forest.is_axial(e) ? axial_xi : ref_xi_default;
     const auto box = forest.leaf_box(e);
     const double hx = 0.5 * (box[1] - box[0]);
     const double hy = 0.5 * (box[3] - box[2]);
