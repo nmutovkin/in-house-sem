@@ -99,3 +99,47 @@ def rayleigh_speed(vp: float, vs: float) -> float:
 
 def rel_l2(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a - b) / np.linalg.norm(b))
+
+
+def lamb_surface(t, stf, x, vp, vs, rho, force=1.0, pad=4):
+    """Lamb's problem: surface displacement (n, 2) at offset x of a vertical
+    line load -force e_z delta(x) stf(t) on the free surface of the
+    half-space z < 0.
+
+    Wavenumber integration with complex frequency w + i eps (eps = pi / T):
+    with potentials decaying into z < 0 and a traction-free surface,
+        u_z(k, w) = F nu_p k_s^2 / (mu R),
+        u_x(k, w) = -i k F (2k^2 - k_s^2 - 2 nu_p nu_s) / (mu R),
+        R = (2k^2 - k_s^2)^2 - 4 k^2 nu_p nu_s,  nu_j = sqrt(k^2 - k_j^2),
+    in the e^{i(kx - wt)} convention. The k step resolves the Rayleigh pole
+    (width ~ eps / c_R); the result does not change with a 4x finer step.
+    """
+    n = len(t)
+    dt = t[1] - t[0]
+    m = pad * n
+    eps = np.pi / (m * dt)
+    tt = np.arange(m) * dt
+    s = np.zeros(m)
+    s[:n] = stf
+    sd = np.fft.rfft(s * np.exp(-eps * tt))
+    w = 2 * np.pi * np.fft.rfftfreq(m, dt)
+    mu = rho * vs * vs
+    active = np.abs(sd) > 1e-6 * np.abs(sd).max()
+    kmax = 6 * w[active].max() / vs + 10.0 / max(abs(x), 1e-3)
+    dk = eps / (10 * vs)
+    k = np.arange(-kmax, kmax + dk, dk)
+    taper = np.cos(0.5 * np.pi * np.clip((np.abs(k) - 0.8 * kmax) / (0.2 * kmax), 0, 1)) ** 2
+    phase = np.exp(1j * k * x) * taper * dk / (2 * np.pi)
+    ux = np.zeros(len(w), complex)
+    uz = np.zeros(len(w), complex)
+    for i in np.nonzero(active)[0]:
+        if i == 0:
+            continue
+        om = w[i] + 1j * eps
+        kp2, ks2 = (om / vp) ** 2, (om / vs) ** 2
+        nup, nus = np.sqrt(k * k - kp2), np.sqrt(k * k - ks2)
+        r = (2 * k * k - ks2) ** 2 - 4 * k * k * nup * nus
+        uz[i] = np.sum(force * nup * ks2 / (mu * r) * phase)
+        ux[i] = np.sum(-1j * k * force * (2 * k * k - ks2 - 2 * nup * nus) / (mu * r) * phase)
+    # u(t) = e^{eps t} irfft(conj(U) * spectrum of s e^{-eps t})
+    return np.array([(np.exp(eps * tt) * np.fft.irfft(np.conj(u) * sd, m))[:n] for u in (ux, uz)]).T

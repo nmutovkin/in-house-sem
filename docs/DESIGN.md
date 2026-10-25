@@ -466,8 +466,8 @@ HDF5 `results.h5`:
 | Gather/scatter: Cᵀ is the exact transpose of C; constraints reproduce polynomials | algebraic identity tests |
 | 2D homogeneous acoustic (pressure), point source | analytic 2D Green's function ⊛ STF |
 | 2D homogeneous elastic, force / moment tensor | analytic 2D elastic Green's function |
-| Lamb's problem | Garvin / Lamb analytic |
-| Fluid–solid interface (reflection, Scholte wave) | analytic plane-wave coefficients; Gar6more2D as black box |
+| Lamb's problem | wavenumber integration with complex frequency (implemented in `tests/python/analytic.py`) |
+| Fluid–solid interface (reflection, Scholte wave) | analytic plane-wave coefficients at normal incidence and the Scholte dispersion relation (implemented); a full fluid–solid point-source reference comes with the wavenumber-integration tools of M3 |
 | Spectral convergence (N, h), conforming **and** refined meshes | expected rates |
 | Spurious reflection at refinement interfaces (hanging nodes) | must stay below a set threshold (e.g. −60 dB at 5 ppw) |
 | Energy conservation, closed box, with and without LTS | constant to round-off (leapfrog / Diaz–Grote energy) |
@@ -497,7 +497,7 @@ Still open:
    simulations on one GPU, rather than MPI.
 4. **Hardware:** GPU models or compute capability, MPI, CUDA-aware MPI, and whether a GPU CI runner is available.
 5. **Dependencies:** confirm permissive-only (BSD, MIT, Apache; LGPL linked dynamically).
-6. **Gmsh:** is the Gmsh Python package acceptable at runtime, or should we only read `.msh` files?
+6. ~~Gmsh at runtime~~ resolved: insem reads `.msh` files itself and needs no Gmsh at runtime.
 
 ---
 
@@ -509,8 +509,8 @@ problems fit on one node or GPU; it becomes essential for 3D.
 | Milestone | Content | Verified by |
 |---|---|---|
 | **M0** Foundations ✅ | CMake + scikit-build, CI (CPU), GLL/GLJ basis, macro-mesh + forest data model (uniform refinement), leaf geometry and geometry kinds, dof map + deterministic gather/scatter, HDF5 I/O, Python bindings | unit tests |
-| **M1** 2D Cartesian core (CPU) ✅ | elastic + acoustic (pressure) element blocks, leapfrog, Stacey, free/rigid boundaries, forcings, point receivers, energy monitor, layered template, OpenMP | analytic 2D Green's functions, Rayleigh speed (the full Lamb solution moves to M2), convergence, energy |
-| **M2** Coupling + refinement | fluid–solid coupling, adaptive quadtree + 2:1 balance + hanging nodes, Gmsh import, SEG-Y/XDMF, YAML | Scholte/reflection, refinement-interface reflection |
+| **M1** 2D Cartesian core (CPU) ✅ | elastic + acoustic (pressure) element blocks, leapfrog, Stacey, free/rigid boundaries, forcings, point receivers, energy monitor, layered template, OpenMP | analytic 2D Green's functions, Rayleigh speed, convergence, energy |
+| **M2** Coupling + refinement ✅ | fluid–solid coupling, adaptive quadtree + 2:1 balance + hanging nodes, Gmsh import, SEG-Y/XDMF, YAML | normal-incidence R/T, Scholte speed, refinement-interface reflection, Lamb's problem (wavenumber integration) |
 | **M3** Axisymmetric monopole | axisym blocks (GLJ axis), borehole template (open/cased hole, beds), monopole source, DWM reference solver, STC post-processing | 3D analytic on axis, DWM open and cased hole |
 | **M4** Dipole (2.5D, m = 1) | azimuthal-mode blocks, mode-dependent axis conditions, dipole source and receivers, flexural dispersion tools | DWM dipole, flexural dispersion |
 | **M5** CUDA backend | all blocks + gather/scatter + observers on GPU, strict-FP mode, batched multi-simulation runs | bitwise CPU/CUDA equivalence, performance |

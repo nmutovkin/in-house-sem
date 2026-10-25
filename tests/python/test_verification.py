@@ -320,3 +320,27 @@ def test_green_function_on_locally_refined_mesh():
     s = sim.solver
     expected = analytic.acoustic_pressure(s.times, stf(s.times), xr - 0.05, zr + 0.03, c, rho)
     assert analytic.rel_l2(s.trace("r", "pressure")[:, 0], expected) < 0.03
+
+
+def test_lamb_problem_surface_line_load():
+    # Vertical line load on the free surface of a half-space, compared with a
+    # wavenumber-integration reference. Measured at x = 4: 1.6 % at order 4,
+    # 0.3 % at order 6 (the reference is converged, so this is SEM error).
+    vp, vs, rho = 2.0, 1.0, 1.0
+    errors = {}
+    for order in (4, 6):
+        m = mesh.rectangle((-12, 12), (-10, 0), nx=96, nz=40)
+        sim = insem.Simulation(m, insem.Discretization(order=order))
+        sim.set_material(0, insem.Material.elastic(vp, vs, rho))
+        for tag in (mesh.BOTTOM, mesh.LEFT, mesh.RIGHT):
+            sim.set_boundary(tag, "absorbing")  # reflections arrive after the window
+        stf = insem.ricker(1.0)
+        sim.add_source(insem.Source.force(0.0, 0.0, 0.0, -1.0, stf))
+        sim.add_receiver("surface", 4.0, 0.0, ["displacement"])
+        sim.set_time(duration=6.5, record_every=2)
+        sim.run()
+        s = sim.solver
+        ref = analytic.lamb_surface(s.times, stf(s.times), 4.0, vp, vs, rho)
+        errors[order] = analytic.rel_l2(s.trace("surface", "displacement"), ref)
+    assert errors[4] < 0.03
+    assert errors[6] < 0.006

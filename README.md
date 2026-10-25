@@ -9,24 +9,33 @@ The architecture, roadmap and open questions are in
 
 ## Status
 
-Milestones **M0 (foundations)** and **M1 (2D Cartesian solver, CPU)** are done.
+Milestones **M0**, **M1** and **M2** are done: a verified 2D Cartesian
+acoustic–elastic solver on CPU with fluid–solid coupling and adaptive meshes.
 
 | Area | What exists |
 |---|---|
-| Physics | 2D isotropic elastic (P–SV) and acoustic (pressure formulation) in Cartesian coordinates, separate regions allowed (fluid–solid coupling is M2) |
-| Discretisation | GLL spectral elements of order 1–8; macro-mesh (Quad4/Quad9) + uniform quadtree refinement; element blocks by geometry kind (`rect`, `affine`, `curved`); deterministic assembly |
-| Time stepping | explicit central differences; stable Δt estimated by power iteration; discrete energy monitor (conserved to round-off) |
-| Boundaries | free / rigid / Stacey absorbing per boundary tag (Stacey damping treated implicitly per point, so it does not limit Δt) |
+| Physics | 2D isotropic elastic (P–SV) and acoustic (pressure formulation), **fluid–solid coupling** |
+| Meshes | macro-mesh (Quad4/Quad9) from templates (`rectangle`, `layered` with curved interfaces) or **Gmsh** (`.msh` 2.2/4.1); **adaptive quadtree refinement** (points per wavelength at f_max, refinement boxes) with 2:1 balance and hanging-node constraints |
+| Discretisation | GLL spectral elements of order 1–8; element blocks by geometry kind (`rect`, `affine`, `curved`); deterministic assembly |
+| Time stepping | explicit central differences; stable Δt from power iteration (coupled operator included); discrete energy monitor |
+| Boundaries | free / rigid / Stacey absorbing per boundary tag |
 | Sources | point force, moment tensor, acoustic monopole at arbitrary positions; Ricker, Gaussian, Gaussian derivative or sampled time functions |
-| Receivers | displacement, velocity, acceleration (elastic); pressure and particle velocity (acoustic), at arbitrary positions |
-| I/O | case files (full problem description), results files (traces, energy); `insem-run` |
-| Python | `insem` package mirroring the C++ objects; `rectangle` and `layered` (curved interfaces) templates |
+| Receivers | displacement, velocity, acceleration (elastic); pressure, particle velocity (acoustic); side selectable on interfaces |
+| Output | case and results files (HDF5), wavefield snapshots, **ParaView (XDMF)** and **SEG-Y rev 2** export |
+| Interfaces | Python API, **YAML configs** and the `insem` command (`run`, `build`, `info`), C++ `insem-run` for case files |
 
-Verification (`tests/python/test_verification.py`): 2D acoustic and elastic
-Green's functions (force, explosion, double couple) on straight and curved
-meshes, fluid particle velocity, spectral convergence of an eigenmode, the
-Rayleigh wave speed, Stacey absorption, and exact integrator identities.
-Typical errors are 0.1–1 %; see the test file for the numbers.
+Verification (`tests/python/test_verification.py`), all against independent
+references:
+
+| Check | Error |
+|---|---|
+| 2D acoustic and elastic Green's functions (force, explosion, double couple), straight and curved meshes | 0.1–1.3 % |
+| Lamb's problem (surface line load), wavenumber-integration reference | 1.6 % (order 4), 0.3 % (order 6) |
+| Fluid–solid reflection / transmission at normal incidence | 4 digits |
+| Scholte wave speed | 0.16 % |
+| Rayleigh wave speed | 0.2 % |
+| Spectral convergence (eigenmode), energy conservation (also on refined meshes) | exponential / round-off |
+| Refinement-interface reflection | −66 dB at ~7.5, −47 dB at ~5 points per wavelength |
 
 ## Building
 
@@ -80,8 +89,16 @@ pressure = sim.solver.trace("h1", "pressure")   # (n_samples, 1)
 sim.save("case.h5")                             # re-run with: insem-run case.h5
 ```
 
-`examples/layered_2d/run.py` is a fuller example: a two-layer elastic model
-with a curved interface, a double-couple source and a vertical receiver line.
+The same through a YAML file and the command line:
+
+```sh
+insem run examples/yaml/water_over_rock.yaml   # case, results, SEG-Y, XDMF
+insem info water_over_rock_out/case.h5
+insem-run water_over_rock_out/case.h5          # C++ executable, no Python needed
+```
+
+`examples/layered_2d/run.py` is a fuller Python example: a two-layer elastic
+model with a curved interface, a double-couple source and a receiver line.
 
 ## Layout
 
@@ -89,9 +106,10 @@ with a curved interface, a double-couple source and a vertical receiver line.
 cpp/include/insem/   public headers (basis, mesh, geometry, ops, physics, solver, io, sim)
 cpp/src/             implementation (cpu/ holds the CPU element kernels)
 cpp/apps/            insem-run
-python/insem/        Python package; python/src/bindings.cpp is the pybind11 module
+python/insem/        Python package (mesh templates, gmsh reader, config/CLI, post-processing);
+                     python/src/bindings.cpp is the pybind11 module
 tests/cpp/           Catch2 unit tests
-tests/python/        pytest tests
+tests/python/        pytest tests, analytic references, Gmsh fixtures
 examples/            runnable examples
 docs/                design documents
 ```
