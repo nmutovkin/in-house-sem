@@ -3,9 +3,11 @@
 Status: **draft v2 for review**. Nothing here is implemented yet.
 
 A spectral element method (SEM) simulator for wave propagation in coupled
-acoustic (fluid) and elastic (solid) media. Its first targets are
-**borehole acoustics** and **passive seismic monitoring**: microseismic
-events recorded by downhole geophones, hydrophones and DAS fibers.
+acoustic (fluid) and elastic (solid) media.
+
+The primary target is **sonic logging**: monopole and dipole sources in open
+and cased holes (casing + cement) crossing layered formations. Passive
+monitoring (microseismic, DAS) is a secondary target and is kept in the design.
 
 ---
 
@@ -41,6 +43,8 @@ References include Patera 1984, Maday & Rønquist 1990, Komatitsch & Vilotte
 
 | Topic | Decision |
 |---|---|
+| Name | `insem` (C++ namespace, Python package, `insem-run` executable) |
+| Primary application | sonic logging: monopole + dipole; open and cased hole (casing, cement); layered formations / bed boundaries |
 | Language | C++17 core, Python bindings (pybind11) |
 | Dimensions | 2D first (Cartesian **and** axisymmetric r–z); designed so 3D (hex, octree) slots in |
 | Physics v1 | isotropic acoustic (**pressure**) + isotropic elastic + **fluid–solid coupling** |
@@ -128,18 +132,41 @@ head waves, Stoneley, pseudo-Rayleigh) at 2D cost.
   off-axis axisymmetric elements are separate element-block types with their own
   quadrature and hoop terms.
 
-**Limitation that matters for microseismic:** pure axisymmetry only allows
-on-axis sources with axisymmetric radiation: explosion, vertical force, and
-vertical dipole or CLVD. General off-axis moment-tensor events need either an
-azimuthal Fourier extension (modes m = 0, ±1, ±2, which also gives
-dipole sonic sources) or full 3D. In v1, microseismic work is done in **2D
-Cartesian (P–SV)**.
+**Limitation:** pure axisymmetry (m = 0) only allows on-axis sources with
+axisymmetric radiation. That covers the monopole sonic source, an explosion
+and a vertical force. The dipole needs §2.5. General off-axis microseismic
+moment tensors need full 3D, so v1 microseismic work is done in 2D Cartesian (P–SV).
 
-### 2.5 Later physics (designed for, not built)
+### 2.5 Azimuthal Fourier modes (2.5D): dipole logging
+
+The geometry stays axisymmetric (the borehole, casing, cement and horizontal
+beds), but the source does not have to be. Fields are expanded in azimuthal
+order m, and each mode is an independent 2D problem on the **same r–z mesh**:
+
+* Elastic, for a source polarised along x:
+  u = (u_r^m(r,z) cos mθ, u_θ^m(r,z) sin mθ, u_z^m(r,z) cos mθ). That is three
+  unknowns per point, and the strain picks up m/r terms from ∂/∂θ.
+* Acoustic: p = p^m(r,z) cos mθ, which adds a −m²/r² term (weighted by r²/ρ).
+* **m = 0** is the monopole (§2.4). **m = 1** is the dipole: flexural waves and
+  shear logging in slow formations. **m = 2** (quadrupole) uses the same code
+  path and can be added later.
+* Axis conditions depend on the mode, and the GLJ axial quadrature handles the
+  1/r and 1/r² terms (Nissen-Meyer et al. 2007). For m = 1: u_z = 0,
+  u_r^1 + u_θ^1 = 0 and p^1 = 0 on the axis (the exact sign depends on the
+  cos/sin convention and is fixed in the implementation notes).
+* Fluid–solid coupling, Stacey boundaries and the element-block structure carry
+  over per mode. Each m is a separate geometry/physics block family.
+* A dipole source in the fluid is a point force density **f**:
+  (1/κ) p̈ = ∇·(1/ρ ∇p) − ∇·(**f**/ρ), so it enters through ∇w. Receivers
+  output the mode amplitude, and the azimuthal pattern (cos θ) is applied in post-processing.
+
+### 2.6 Later physics (designed for, not built)
 
 * Attenuation: standard linear solids with memory variables per GLL point.
-* Anisotropy: a full C_ij per GLL point (VTI/TTI for shale microseismic).
+* Anisotropy: a full C_ij per GLL point. VTI in a vertical well remains
+  axisymmetric and fits §2.4–2.5; deviated wells and TTI need 3D.
 * Topography and curved interfaces: already supported through curved macro-elements (§6).
+* A logging-tool body: just another elastic annulus in the borehole template.
 
 ---
 
@@ -212,6 +239,7 @@ its derivative) gives the weights.
 * Point force and **moment tensor** (solid) for microseismic. 2D Cartesian
   uses M_xx, M_zz and M_xz; axisymmetric mode allows on-axis axisymmetric parts only.
 * Volume-injection monopole (fluid) for borehole sonic sources (§2.2).
+* Dipole: a point force in the fluid or solid, run in mode m = 1 (§2.5).
 * Source time functions: Ricker, Gaussian and derivatives, smoothed step, or a user array.
 * Any number of sources, for multi-event microseismic catalogues.
 
@@ -235,8 +263,12 @@ Observers record into device-side buffers that are flushed to the host every K s
 The macro-mesh honours geometry. Every material interface, and in particular
 every fluid–solid interface, lies on macro-element faces. Sources of macro-meshes:
 * **In-house templates (Python):** a layered model (layers bounded by z_k(x)
-  or z_k(r)), and a **borehole template** (fluid column r < a, optional tool,
-  casing and cement annuli, then formation layers).
+  or z_k(r)), and a **borehole template**: a fluid column r < a, then optional
+  steel casing and cement annuli (bonded = shared solid–solid faces; a
+  debonded fluid micro-annulus is just a thin fluid annulus), then the
+  formation, split into horizontal beds at given depths.
+* Thin annuli (casing about 1 cm thick, with v_p ≈ 5.9 km/s) produce tiny
+  elements. They are the main reason local time stepping (§3.2) is on the roadmap.
 * **Gmsh import:** `.msh` v4, quad4 and quad9 (hex later), with physical groups
   mapped to materials and boundary tags.
 
@@ -396,6 +428,9 @@ HDF5 `results.h5`:
 /snapshots/<field>/<step>             (optional, decimated)
 ```
 * SEG-Y rev 2 export (receiver gathers, DAS channels).
+* Sonic post-processing (Python): slowness–time coherence (STC), dispersion
+  extraction (matrix pencil / Prony) across a receiver array, and overlays of
+  modal dispersion curves computed by the reference solver (§9).
 * XDMF sidecar files over the snapshots for ParaView, written as leaf-level
   high-order cells subdivided for display.
 
@@ -416,7 +451,8 @@ HDF5 `results.h5`:
 | Energy conservation, closed box, with and without LTS | constant to round-off (leapfrog / Diaz–Grote energy) |
 | Stacey reflection vs incidence angle | larger-domain reference |
 | Axisym point sources on axis | analytic 3D spherical waves |
-| Borehole monopole (Stoneley, head waves) | in-house discrete-wavenumber reference (Tsang & Rader 1979) |
+| Borehole monopole and dipole, open and cased hole (homogeneous formation) | in-house discrete-wavenumber reference with radial propagator matrices (Tsang & Rader 1979; Kurkjian & Chang 1986; Tubman et al. 1984 for cased holes) |
+| Stoneley and flexural dispersion | modal root-finding of the borehole dispersion relation vs SEM-extracted dispersion |
 | DAS gauge-length response | strain from analytic displacement |
 | CPU vs CUDA (strict build), 1 vs N ranks | **bitwise** identical |
 
@@ -424,32 +460,43 @@ HDF5 `results.h5`:
 
 ## 10. Open questions for review
 
-1. **Name** of the package and namespace (`insem` is a placeholder).
-2. **Typical scales:** frequencies (sonic logging is about 1–20 kHz; microseismic
-   is about 10–500 Hz), domain sizes, and run lengths.
-3. **Borehole detail in v1:** do you need the tool body, casing and cement, or only a fluid column?
-4. **DAS placement:** is the fiber cemented behind casing (solid strain) or in the fluid?
-5. **Microseismic in 2D:** is 2D Cartesian P–SV acceptable for v1, or should azimuthal Fourier (2.5D) or 3D come earlier?
-6. **Hardware:** GPU models or compute capability, MPI implementation, CUDA-aware MPI, and whether a GPU CI runner is available.
-7. **Dependencies:** confirm permissive-only (BSD, MIT, Apache; LGPL linked dynamically).
-8. **Gmsh:** is the Gmsh Python package acceptable at runtime, or should we only read `.msh` files?
+Resolved: the name is `insem`. The target is sonic logging (monopole + dipole,
+cased hole, layered formations). No anisotropy or attenuation early.
+
+Still open:
+1. **Typical runs:** frequency band (monopole about 1–20 kHz, dipole about
+   0.5–5 kHz?), borehole and casing dimensions, source–receiver offsets and array
+   length, and record length. These set the domain size and Δt, and decide when
+   C-PML and LTS become urgent.
+2. **Tool:** do we ever need the tool body (a rigid or elastic mandrel), or
+   is a free fluid column enough? It is cheap to add as an annulus (§2.6).
+3. **Run volume:** many small 2.5D runs (parameter sweeps, inversion) or a
+   few big ones? Many small runs favour batching several independent
+   simulations on one GPU, rather than MPI.
+4. **Hardware:** GPU models or compute capability, MPI, CUDA-aware MPI, and whether a GPU CI runner is available.
+5. **Dependencies:** confirm permissive-only (BSD, MIT, Apache; LGPL linked dynamically).
+6. **Gmsh:** is the Gmsh Python package acceptable at runtime, or should we only read `.msh` files?
 
 ---
 
 ## 11. Roadmap
 
+The order is driven by sonic logging. MPI moves later because 2.5D borehole
+problems fit on one node or GPU; it becomes essential for 3D.
+
 | Milestone | Content | Verified by |
 |---|---|---|
-| **M0** Foundations | CMake + scikit-build, CI (CPU), GLL/GLJ basis, macro-mesh + forest data model, dof map / gather–scatter (conforming), `Simulation` skeleton, HDF5 case and results I/O | unit tests |
-| **M1** 2D Cartesian core (CPU) | elastic + acoustic (pressure) element blocks (`rect`, `affine`, `curved`), leapfrog, Stacey, free/rigid boundaries, forcings, point receivers, energy monitor, layered template, OpenMP | analytic 2D, Lamb, convergence, energy |
-| **M2** Coupling + refinement | fluid–solid coupling, quadtree refinement + 2:1 balance + hanging-node constraints, Gmsh import, DAS, SEG-Y/XDMF, YAML | Scholte/reflection, refinement-interface reflection, DAS analytic |
-| **M3** Axisymmetric | axisym geometry kinds (GLJ axis), borehole template, monopole source | 3D analytic on axis, DWM borehole |
-| **M4** CUDA backend | all M1–M3 blocks + gather/scatter + observers on GPU, strict-FP mode | bitwise CPU/CUDA equivalence, performance |
-| **M5** MPI | SFC partitioning, halo exchange (CPU and CUDA), distributed observers, parallel HDF5 | 1-vs-N-rank bitwise, scaling |
-| **M6** C-PML | PML element blocks, LDDRK integrator | reflection vs Stacey |
-| **M7** Local time stepping | Diaz–Grote multi-rate leapfrog, LTS-level blocks, cost-weighted partitioning | energy conservation, accuracy vs global Δt, speed-up on borehole cases |
-| **M8** 3D | hex blocks, octree forest, 3D templates, Gmsh hex import, 3D microseismic + 3D fibers | 3D analytic, Lamb 3D |
-| Later | attenuation, anisotropy, topography, 2.5D azimuthal Fourier (dipole logging), adjoint (microseismic location and inversion) | |
+| **M0** Foundations | CMake + scikit-build, CI (CPU), GLL/GLJ basis, macro-mesh + forest data model (uniform refinement), leaf geometry and geometry kinds, dof map + deterministic gather/scatter, HDF5 I/O, Python bindings | unit tests |
+| **M1** 2D Cartesian core (CPU) | elastic + acoustic (pressure) element blocks, leapfrog, Stacey, free/rigid boundaries, forcings, point receivers, energy monitor, layered template, OpenMP | analytic 2D, Lamb, convergence, energy |
+| **M2** Coupling + refinement | fluid–solid coupling, adaptive quadtree + 2:1 balance + hanging nodes, Gmsh import, SEG-Y/XDMF, YAML | Scholte/reflection, refinement-interface reflection |
+| **M3** Axisymmetric monopole | axisym blocks (GLJ axis), borehole template (open/cased hole, beds), monopole source, DWM reference solver, STC post-processing | 3D analytic on axis, DWM open and cased hole |
+| **M4** Dipole (2.5D, m = 1) | azimuthal-mode blocks, mode-dependent axis conditions, dipole source and receivers, flexural dispersion tools | DWM dipole, flexural dispersion |
+| **M5** CUDA backend | all blocks + gather/scatter + observers on GPU, strict-FP mode, batched multi-simulation runs | bitwise CPU/CUDA equivalence, performance |
+| **M6** C-PML | PML blocks (all geometry kinds, including axisym and modes), LDDRK | reflection vs Stacey, guided-wave absorption |
+| **M7** Local time stepping | Diaz–Grote multi-rate leapfrog, per-level blocks | energy, accuracy, speed-up on cased-hole cases |
+| **M8** MPI | SFC partitioning, halo exchange (CPU and CUDA), distributed observers | 1-vs-N-rank bitwise, scaling |
+| **M9** 3D | hex blocks, octree forest, deviated wells, 3D microseismic, DAS fibers | 3D analytic, Lamb 3D |
+| Later | quadrupole (m = 2), tool body, VTI, attenuation, topography, adjoint/inversion | |
 
-M0–M3 can be developed and fully verified in this environment (CPU). M4 and
-M5 need your GPU and MPI hardware for final validation.
+M0–M4 can be developed and fully verified in this environment (CPU). M5 and
+M8 need your GPU and MPI hardware for final validation.
