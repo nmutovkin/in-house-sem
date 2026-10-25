@@ -40,4 +40,4 @@ jobs:
       - name: Build and install
         run: pip install ".[test]"
       - name: Test
-        run: pytest -q
+        run: pytest -q --runslow

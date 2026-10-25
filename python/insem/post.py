@@ -305,3 +305,64 @@ def read_segy(path) -> SegyData:
         sz[i] = unscale(get(h, 45, "i"), zscalar)
         data[i] = np.frombuffer(raw, dtype=">f4", count=ns, offset=3600 + i * size + 240)
     return SegyData(text, dt_us * 1e-6, data, gx, gz, sx, sz)
+
+
+# --------------------------------------------------------------- sonic logs
+
+
+@dataclass
+class STC:
+    """Slowness-time coherence (semblance) of an array: coherence[slowness, time]."""
+
+    slowness: np.ndarray  # s/m
+    time: np.ndarray      # window start times at the first receiver (s)
+    coherence: np.ndarray
+
+    def peak(self, t_min: float = -np.inf, t_max: float = np.inf, s_min: float = 0.0,
+             s_max: float = np.inf) -> Tuple[float, float, float]:
+        """(slowness, time, coherence) of the largest coherence in a region."""
+        si = (self.slowness >= s_min) & (self.slowness <= s_max)
+        ti = (self.time >= t_min) & (self.time <= t_max)
+        sub = np.where(si[:, None] & ti[None, :], self.coherence, -np.inf)
+        i, j = np.unravel_index(np.argmax(sub), sub.shape)
+        return float(self.slowness[i]), float(self.time[j]), float(self.coherence[i, j])
+
+
+def stc(traces: np.ndarray, offsets: Sequence[float], dt: float, slowness: Sequence[float],
+        window: float, times: Optional[Sequence[float]] = None, t0: float = 0.0,
+        min_energy: float = 1e-6) -> STC:
+    """Slowness-time coherence (Kimball & Marzetta 1984) of an array.
+
+    traces: (n_receivers, n_samples) sampled at t0 + i dt; offsets in m
+    (along the borehole); slowness in s/m; window length in s; times are
+    window start times at the first receiver (default: every sample).
+
+    coherence(s, T) = sum_t (sum_i x_i(t + s (z_i - z_0)))^2
+                      / (N sum_t sum_i x_i(t + s (z_i - z_0))^2),  t in [T, T + window].
+
+    Semblance is normalised, so nearly silent windows (before the first
+    arrival, numerical noise) can look coherent: coherence is set to 0 where
+    the window energy is below `min_energy` times the largest window energy.
+    """
+    x = np.asarray(traces, float)
+    z = np.asarray(offsets, float) - float(offsets[0])
+    n_rec, n = x.shape
+    t = t0 + dt * np.arange(n)
+    slowness = np.asarray(slowness, float)
+    times = t[t <= t[-1] - window] if times is None else np.asarray(times, float)
+    nw = max(2, int(round(window / dt)) + 1)
+    tau = np.arange(nw) * dt
+    coh = np.zeros((len(slowness), len(times)))
+    energy = np.zeros_like(coh)
+    for a, s in enumerate(slowness):
+        # shifted[i, j, k] = x_i(T_j + tau_k + s z_i)
+        shifted = np.empty((n_rec, len(times), nw))
+        for i in range(n_rec):
+            tq = times[:, None] + tau[None, :] + s * z[i]
+            shifted[i] = np.interp(tq, t, x[i], left=0.0, right=0.0)
+        num = (shifted.sum(axis=0) ** 2).sum(axis=1)
+        den = n_rec * (shifted**2).sum(axis=(0, 2))
+        coh[a] = np.where(den > 0, num / np.where(den > 0, den, 1.0), 0.0)
+        energy[a] = den
+    coh[energy < min_energy * energy.max()] = 0.0
+    return STC(slowness, times, coh)
