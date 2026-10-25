@@ -308,6 +308,8 @@ void Simulation::save(const std::string& path) const {
   f.set_attribute("/time", "duration", time_.duration);
   f.set_attribute("/time", "record_every", static_cast<std::int64_t>(time_.record_every));
   f.set_attribute("/time", "energy_every", static_cast<std::int64_t>(time_.energy_every));
+  f.set_attribute("/time", "snapshot_every", static_cast<std::int64_t>(time_.snapshot_every));
+  f.set_attribute("/time", "snapshot_quantities", join(time_.snapshot_quantities));
 }
 
 Simulation Simulation::load(const std::string& path) {
@@ -425,6 +427,10 @@ Simulation Simulation::load(const std::string& path) {
     t.duration = f.attribute_double("/time", "duration");
     t.record_every = static_cast<int>(f.attribute_int("/time", "record_every"));
     t.energy_every = static_cast<int>(f.attribute_int("/time", "energy_every"));
+    if (f.has_attribute("/time", "snapshot_every")) {
+      t.snapshot_every = static_cast<int>(f.attribute_int("/time", "snapshot_every"));
+      t.snapshot_quantities = split(f.attribute_string("/time", "snapshot_quantities"));
+    }
     sim.set_time(t);
   }
   return sim;

@@ -111,6 +111,23 @@ class Solver {
   // quadratic forms of the pressure equation.
   const std::vector<std::array<double, 3>>& energy() const { return energy_; }
 
+  // Wavefield snapshots, stored per element point (constrained points
+  // interpolated), so they can be drawn element by element:
+  //   data: [snapshot][component][element point], float.
+  struct Snapshot {
+    Medium medium;
+    std::string quantity;
+    int ncomp = 0;
+    std::vector<float> data;
+  };
+  const std::vector<Snapshot>& snapshots() const { return snapshots_; }
+  const std::vector<double>& snapshot_times() const { return snapshot_times_; }
+  // Element-point coordinates [2][n_elements * npe] and sub-quad
+  // connectivity [n_cells][4] (each element split along its GLL lines) of
+  // the domain of `medium`.
+  std::vector<double> snapshot_points(Medium medium) const;
+  std::vector<std::int32_t> snapshot_cells(Medium medium) const;
+
   void write_results(const std::string& path) const;
 
  private:
@@ -150,6 +167,7 @@ class Solver {
   double kinetic_energy() const;
   void initialize();
   void record();
+  void record_snapshot();
 
   physics::KernelBasis kernel_basis_;
   basis::LagrangeBasis lagrange_;
@@ -165,6 +183,10 @@ class Solver {
   std::vector<Trace> traces_;
   std::vector<double> sample_times_;
   std::vector<std::array<double, 3>> energy_;
+  std::vector<Snapshot> snapshots_;
+  std::vector<double> snapshot_times_;
+  std::vector<double> geometry_x_, geometry_z_;  // per element point, all leaves
+  int snapshot_every_ = 0;
   double potential_ = 0.0;
 
   double dt_ = 0.0;

@@ -80,12 +80,29 @@ Solver::Solver(const Problem& p)
   INSEM_CHECK(p.time.energy_every >= 0, "energy_every must be >= 0");
   record_every_ = p.time.record_every;
   energy_every_ = p.time.energy_every;
+  INSEM_CHECK(p.time.snapshot_every >= 0, "snapshot_every must be >= 0");
+  snapshot_every_ = p.time.snapshot_every;
+  geometry_x_ = p.geometry.x;
+  geometry_z_ = p.geometry.z;
 
   build_domains(p);
   for (Domain& d : domains_) build_boundaries(p, d);
   build_coupling(p);
   build_sources(p);
   build_receivers(p);
+  if (snapshot_every_ > 0) {
+    for (const std::string& q : p.time.snapshot_quantities) {
+      INSEM_CHECK(q == "displacement" || q == "velocity" || q == "acceleration" || q == "pressure",
+                  "unknown snapshot quantity '" << q << "' (displacement, velocity, acceleration, pressure)");
+      for (const Domain& d : domains_) {
+        const bool exists = d.medium == Medium::Elastic
+                                ? (q == "displacement" || q == "velocity" || q == "acceleration")
+                                : q == "pressure";
+        if (!exists) continue;
+        snapshots_.push_back({d.medium, q, d.ncomp, {}});
+      }
+    }
+  }
 
   stable_dt_ = estimate_stable_dt();
   if (p.time.dt > 0.0) {
@@ -642,6 +659,60 @@ void Solver::record() {
   }
 }
 
+void Solver::record_snapshot() {
+  snapshot_times_.push_back(time());
+  for (Snapshot& snap : snapshots_) {
+    Domain& d = domains_[domain_index(snap.medium)];
+    const std::vector<real_t>& field = (snap.quantity == "velocity") ? d.v : (snap.quantity == "acceleration") ? d.a : d.u;
+    // d.u_local is kernel scratch, free between steps.
+    d.dofs.gather(field.data(), d.u_local.data(), d.ncomp);
+    const std::size_t npe = static_cast<std::size_t>(d.dofs.points_per_element());
+    for (int c = 0; c < d.ncomp; ++c) {
+      for (std::size_t e = 0; e < d.leaves.size(); ++e) {
+        const real_t* src = &d.u_local[(e * d.ncomp + c) * npe];
+        snap.data.insert(snap.data.end(), src, src + npe);
+      }
+    }
+  }
+}
+
+std::vector<double> Solver::snapshot_points(Medium medium) const {
+  const int di = domain_index(medium);
+  INSEM_CHECK(di >= 0, "the model has no " << to_string(medium) << " region");
+  const Domain& d = domains_[di];
+  const std::size_t npe = static_cast<std::size_t>(d.dofs.points_per_element());
+  const std::size_t n = d.leaves.size() * npe;
+  std::vector<double> out(2 * n);
+  for (std::size_t e = 0; e < d.leaves.size(); ++e) {
+    for (std::size_t k = 0; k < npe; ++k) {
+      const std::size_t q = static_cast<std::size_t>(d.leaves[e]) * npe + k;
+      out[e * npe + k] = geometry_x_[q];
+      out[n + e * npe + k] = geometry_z_[q];
+    }
+  }
+  return out;
+}
+
+std::vector<std::int32_t> Solver::snapshot_cells(Medium medium) const {
+  const int di = domain_index(medium);
+  INSEM_CHECK(di >= 0, "the model has no " << to_string(medium) << " region");
+  const Domain& d = domains_[di];
+  const int ngll = d.dofs.ngll();
+  const std::int32_t npe = ngll * ngll;
+  std::vector<std::int32_t> out;
+  out.reserve(d.leaves.size() * (ngll - 1) * (ngll - 1) * 4);
+  for (std::size_t e = 0; e < d.leaves.size(); ++e) {
+    const std::int32_t base = static_cast<std::int32_t>(e) * npe;
+    for (int j = 0; j + 1 < ngll; ++j) {
+      for (int i = 0; i + 1 < ngll; ++i) {
+        out.insert(out.end(), {base + j * ngll + i, base + j * ngll + i + 1, base + (j + 1) * ngll + i + 1,
+                               base + (j + 1) * ngll + i});
+      }
+    }
+  }
+  return out;
+}
+
 void Solver::initialize() {
   const bool energy = energy_every_ > 0;
   compute_acceleration(0.0, energy, false);
@@ -660,6 +731,7 @@ void Solver::initialize() {
   }
   initialized_ = true;
   record();
+  if (snapshot_every_ > 0) record_snapshot();
   if (energy) energy_.push_back({0.0, kinetic_energy(), potential_});
 }
 
@@ -723,6 +795,7 @@ void Solver::advance(int n) {
       r.prev_az = az;
     }
     if (step_ % record_every_ == 0) record();
+    if (snapshot_every_ > 0 && step_ % snapshot_every_ == 0) record_snapshot();
     if (energy) energy_.push_back({step_ * dt, kinetic_energy(), potential_});
   }
 }
@@ -746,6 +819,29 @@ void Solver::write_results(const std::string& path) const {
     f.set_attribute(group, "medium", to_string(domains_[r.domain].medium));
     f.set_attribute(group, "x", r.position[0]);
     f.set_attribute(group, "z", r.position[1]);
+  }
+  if (!snapshots_.empty()) {
+    f.write("/snapshots/time", snapshot_times_);
+    const std::size_t ns = snapshot_times_.size();
+    for (Medium medium : {Medium::Acoustic, Medium::Elastic}) {
+      if (domain_index(medium) < 0) continue;
+      const std::string g = "/snapshots/" + to_string(medium);
+      const auto pts = snapshot_points(medium);
+      const std::size_t n = pts.size() / 2;
+      std::vector<double> xz(2 * n);
+      for (std::size_t i = 0; i < n; ++i) {
+        xz[2 * i] = pts[i];
+        xz[2 * i + 1] = pts[n + i];
+      }
+      f.write(g + "/points", xz.data(), {n, 2});
+      const auto cells = snapshot_cells(medium);
+      f.write(g + "/cells", cells.data(), {cells.size() / 4, 4});
+    }
+    for (const Snapshot& snap : snapshots_) {
+      const std::size_t n = snap.data.size() / (ns * snap.ncomp);
+      f.write("/snapshots/" + to_string(snap.medium) + "/" + snap.quantity, snap.data.data(),
+              {ns, static_cast<std::size_t>(snap.ncomp), n});
+    }
   }
   if (!energy_.empty()) {
     std::vector<double> e;

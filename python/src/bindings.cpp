@@ -318,7 +318,9 @@ PYBIND11_MODULE(_core, m) {
       .def_readonly("n_steps", &TimeConfig::n_steps)
       .def_readonly("duration", &TimeConfig::duration)
       .def_readonly("record_every", &TimeConfig::record_every)
-      .def_readonly("energy_every", &TimeConfig::energy_every);
+      .def_readonly("energy_every", &TimeConfig::energy_every)
+      .def_readonly("snapshot_every", &TimeConfig::snapshot_every)
+      .def_readonly("snapshot_quantities", &TimeConfig::snapshot_quantities);
 
   // ---- solver
   py::class_<solver::Solver>(m, "Solver")
@@ -368,6 +370,25 @@ PYBIND11_MODULE(_core, m) {
         for (const auto& row : s.energy()) e.insert(e.end(), row.begin(), row.end());
         return to_numpy(e, {static_cast<py::ssize_t>(s.energy().size()), 3});
       }, "(n, 3) energy monitor samples: time, kinetic, potential.")
+      .def("snapshot", [](const solver::Solver& s, const std::string& medium, const std::string& quantity) {
+        const Medium m = medium_from_string(medium);
+        for (const auto& snap : s.snapshots()) {
+          if (snap.medium != m || snap.quantity != quantity) continue;
+          const py::ssize_t ns = static_cast<py::ssize_t>(s.snapshot_times().size());
+          const py::ssize_t n = ns ? static_cast<py::ssize_t>(snap.data.size()) / (ns * snap.ncomp) : 0;
+          return to_numpy(snap.data, {ns, snap.ncomp, n});
+        }
+        throw Error("no " + quantity + " snapshots for the " + medium + " medium");
+      }, py::arg("medium"), py::arg("quantity"), "(n_snapshots, ncomp, n_points) snapshot data.")
+      .def("snapshot_points", [](const solver::Solver& s, const std::string& medium) {
+        const auto p = s.snapshot_points(medium_from_string(medium));
+        return to_numpy(p, {2, static_cast<py::ssize_t>(p.size() / 2)});
+      }, py::arg("medium"), "(2, n_points) coordinates of the snapshot points.")
+      .def("snapshot_cells", [](const solver::Solver& s, const std::string& medium) {
+        const auto c = s.snapshot_cells(medium_from_string(medium));
+        return to_numpy(c, {static_cast<py::ssize_t>(c.size() / 4), 4});
+      }, py::arg("medium"), "(n_cells, 4) sub-quad connectivity of the snapshot points.")
+      .def_property_readonly("snapshot_times", [](const solver::Solver& s) { return to_numpy(s.snapshot_times()); })
       .def("write_results", &solver::Solver::write_results, py::arg("path"));
 
   // ---- simulation
@@ -429,7 +450,8 @@ PYBIND11_MODULE(_core, m) {
            "medium ('acoustic' / 'elastic') picks the side of a receiver on a fluid-solid interface.")
       .def("clear_receivers", &Simulation::clear_receivers)
       .def("set_time", [](Simulation& s, int n_steps, double duration, double dt, double safety,
-                          int record_every, int energy_every) {
+                          int record_every, int energy_every, int snapshot_every,
+                          std::vector<std::string> snapshot_quantities) {
         TimeConfig t;
         t.n_steps = n_steps;
         t.duration = duration;
@@ -437,9 +459,12 @@ PYBIND11_MODULE(_core, m) {
         t.safety = safety;
         t.record_every = record_every;
         t.energy_every = energy_every;
+        t.snapshot_every = snapshot_every;
+        t.snapshot_quantities = std::move(snapshot_quantities);
         s.set_time(t);
       }, py::arg("n_steps") = 0, py::arg("duration") = 0.0, py::arg("dt") = 0.0, py::arg("safety") = 0.8,
-           py::arg("record_every") = 1, py::arg("energy_every") = 0,
+           py::arg("record_every") = 1, py::arg("energy_every") = 0, py::arg("snapshot_every") = 0,
+           py::arg("snapshot_quantities") = std::vector<std::string>{"velocity", "pressure"},
            "Time settings. dt = 0 picks safety * the estimated stability limit; n_steps = 0 derives it from duration.")
       .def_property_readonly("materials", &Simulation::materials)
       .def_property_readonly("boundaries", [](const Simulation& s) {

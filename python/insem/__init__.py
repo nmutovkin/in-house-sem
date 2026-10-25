@@ -26,7 +26,7 @@ from ._core import (
     ricker,
     sampled_stf,
 )
-from . import basis, mesh
+from . import basis, mesh, post
 
 __all__ = [
     "Discretization",
@@ -48,6 +48,7 @@ __all__ = [
     "gaussian_derivative",
     "global_coordinates",
     "mesh",
+    "post",
     "real_dtype",
     "ricker",
     "sampled_stf",

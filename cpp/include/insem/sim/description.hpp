@@ -117,6 +117,10 @@ struct TimeConfig {
   double duration = 0.0;    // simulated time (s), used when n_steps = 0
   int record_every = 1;     // receiver sampling interval in steps
   int energy_every = 0;     // energy monitor interval in steps (0 = off)
+  int snapshot_every = 0;   // wavefield snapshot interval in steps (0 = off)
+  // Snapshot quantities; each is stored for the media where it exists
+  // (elastic: displacement, velocity, acceleration; acoustic: pressure).
+  std::vector<std::string> snapshot_quantities{"velocity", "pressure"};
 };
 
 }  // namespace insem
