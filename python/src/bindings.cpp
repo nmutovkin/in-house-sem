@@ -5,7 +5,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -17,7 +19,9 @@
 #include "insem/mesh/forest.hpp"
 #include "insem/mesh/macro_mesh.hpp"
 #include "insem/ops/dof_map.hpp"
+#include "insem/sim/description.hpp"
 #include "insem/sim/simulation.hpp"
+#include "insem/solver/solver.hpp"
 
 namespace py = pybind11;
 using namespace insem;
@@ -185,7 +189,8 @@ PYBIND11_MODULE(_core, m) {
 
   // ---- ops
   py::class_<ops::DofMap>(m, "DofMap")
-      .def_static("build", &ops::DofMap::build, py::arg("forest"), py::arg("ngll"))
+      .def_static("build", py::overload_cast<const mesh::Forest&, int>(&ops::DofMap::build), py::arg("forest"),
+                  py::arg("ngll"))
       .def_property_readonly("ngll", &ops::DofMap::ngll)
       .def_property_readonly("n_elements", &ops::DofMap::n_elements)
       .def_property_readonly("n_global", &ops::DofMap::n_global)
@@ -225,6 +230,132 @@ PYBIND11_MODULE(_core, m) {
       py::arg("dofs"), py::arg("geometry"),
       "(coordinates (2, n_global), max mismatch between element-local copies).");
 
+  // ---- problem description
+  py::class_<Material>(m, "Material")
+      .def_static("acoustic", [](double vp, double rho) {
+        const Material mat = Material::acoustic(vp, rho);
+        mat.validate();
+        return mat;
+      }, py::arg("vp"), py::arg("rho"))
+      .def_static("elastic", [](double vp, double vs, double rho) {
+        const Material mat = Material::elastic(vp, vs, rho);
+        mat.validate();
+        return mat;
+      }, py::arg("vp"), py::arg("vs"), py::arg("rho"))
+      .def_property_readonly("medium", [](const Material& mat) { return to_string(mat.medium); })
+      .def_readonly("vp", &Material::vp)
+      .def_readonly("vs", &Material::vs)
+      .def_readonly("rho", &Material::rho)
+      .def("__repr__", [](const Material& mat) {
+        std::ostringstream os;
+        os << "<Material " << to_string(mat.medium) << " vp=" << mat.vp;
+        if (mat.medium == Medium::Elastic) os << " vs=" << mat.vs;
+        os << " rho=" << mat.rho << ">";
+        return os.str();
+      });
+
+  py::class_<SourceTimeFunction>(m, "SourceTimeFunction")
+      .def_property_readonly("kind", &SourceTimeFunction::kind_name)
+      .def_readonly("f0", &SourceTimeFunction::f0)
+      .def_readonly("t0", &SourceTimeFunction::t0)
+      .def_readonly("amplitude", &SourceTimeFunction::amplitude)
+      .def("__call__", [](const SourceTimeFunction& stf, double t) { return stf(t); }, py::arg("t"))
+      .def("__call__", [](const SourceTimeFunction& stf, const CArray<double>& t) {
+        py::array_t<double> out(t.size());
+        for (py::ssize_t i = 0; i < t.size(); ++i) out.mutable_data()[i] = stf(t.data()[i]);
+        return out;
+      }, py::arg("t"));
+  auto t0_or_default = [](py::object t0) { return t0.is_none() ? -1.0 : t0.cast<double>(); };
+  m.def("ricker", [t0_or_default](double f0, py::object t0, double amplitude) {
+          return SourceTimeFunction::ricker(f0, t0_or_default(t0), amplitude);
+        }, py::arg("f0"), py::arg("t0") = py::none(), py::arg("amplitude") = 1.0,
+        "Ricker wavelet with dominant frequency f0 (default delay t0 = 1.2 / f0).");
+  m.def("gaussian", [t0_or_default](double f0, py::object t0, double amplitude) {
+          return SourceTimeFunction::gaussian(f0, t0_or_default(t0), amplitude);
+        }, py::arg("f0"), py::arg("t0") = py::none(), py::arg("amplitude") = 1.0);
+  m.def("gaussian_derivative", [t0_or_default](double f0, py::object t0, double amplitude) {
+          return SourceTimeFunction::gaussian_derivative(f0, t0_or_default(t0), amplitude);
+        }, py::arg("f0"), py::arg("t0") = py::none(), py::arg("amplitude") = 1.0);
+  m.def("sampled_stf", [](const CArray<double>& samples, double dt, double amplitude) {
+          return SourceTimeFunction::sampled(to_vector(samples), dt, amplitude);
+        }, py::arg("samples"), py::arg("dt"), py::arg("amplitude") = 1.0,
+        "Source time function from samples at t = i * dt (linear interpolation).");
+
+  py::class_<Source>(m, "Source")
+      .def_static("force", &Source::force, py::arg("x"), py::arg("z"), py::arg("fx"), py::arg("fz"),
+                  py::arg("stf"))
+      .def_static("moment_tensor", &Source::moment_tensor, py::arg("x"), py::arg("z"), py::arg("mxx"),
+                  py::arg("mzz"), py::arg("mxz"), py::arg("stf"))
+      .def_static("monopole", &Source::monopole, py::arg("x"), py::arg("z"), py::arg("stf"),
+                  "Acoustic volume-injection source; stf is d^2Q/dt^2 (m^3/s^2 per unit length in 2D).")
+      .def_property_readonly("kind", &Source::kind_name)
+      .def_readonly("position", &Source::position)
+      .def_readonly("components", &Source::components)
+      .def_readonly("stf", &Source::stf);
+
+  py::class_<Receiver>(m, "Receiver")
+      .def_readonly("name", &Receiver::name)
+      .def_readonly("position", &Receiver::position)
+      .def_readonly("quantities", &Receiver::quantities);
+
+  py::class_<TimeConfig>(m, "TimeConfig")
+      .def_readonly("dt", &TimeConfig::dt)
+      .def_readonly("safety", &TimeConfig::safety)
+      .def_readonly("n_steps", &TimeConfig::n_steps)
+      .def_readonly("duration", &TimeConfig::duration)
+      .def_readonly("record_every", &TimeConfig::record_every)
+      .def_readonly("energy_every", &TimeConfig::energy_every);
+
+  // ---- solver
+  py::class_<solver::Solver>(m, "Solver")
+      .def_property_readonly("dt", &solver::Solver::dt)
+      .def_property_readonly("stable_dt", &solver::Solver::stable_dt)
+      .def_property_readonly("n_steps", &solver::Solver::n_steps)
+      .def_property_readonly("step", &solver::Solver::step)
+      .def_property_readonly("time", &solver::Solver::time)
+      .def("advance", &solver::Solver::advance, py::arg("n_steps"), py::call_guard<py::gil_scoped_release>())
+      .def("run", &solver::Solver::run, py::call_guard<py::gil_scoped_release>())
+      .def_property_readonly("media", [](const solver::Solver& s) {
+        std::vector<std::string> out;
+        for (std::size_t i = 0; i < s.n_domains(); ++i) out.push_back(to_string(s.domain(i).medium));
+        return out;
+      })
+      .def("coordinates", [](const solver::Solver& s, const std::string& medium) {
+        const int di = s.domain_index(medium_from_string(medium));
+        INSEM_CHECK(di >= 0, "the model has no " << medium << " region");
+        const auto& d = s.domain(di);
+        return to_numpy(d.coords, {2, d.n_global()});
+      }, py::arg("medium"), "(2, n_points) coordinates of the global points of a medium.")
+      .def("state", [](const solver::Solver& s, const std::string& medium) {
+        const int di = s.domain_index(medium_from_string(medium));
+        INSEM_CHECK(di >= 0, "the model has no " << medium << " region");
+        const auto& d = s.domain(di);
+        auto conv = [&](const std::vector<real_t>& v) {
+          return to_numpy(std::vector<double>(v.begin(), v.end()), {d.ncomp, d.n_global()});
+        };
+        return py::make_tuple(conv(d.u), conv(d.v), conv(d.a));
+      }, py::arg("medium"),
+           "(field, first, second time derivative), each (ncomp, n_points): displacement (elastic) or pressure (acoustic).")
+      .def("set_state", [](solver::Solver& s, const std::string& medium, const CArray<double>& u,
+                           const CArray<double>& v) {
+        s.set_state(medium_from_string(medium), to_vector(u), to_vector(v));
+      }, py::arg("medium"), py::arg("u"), py::arg("v"))
+      .def("trace", [](const solver::Solver& s, const std::string& receiver, const std::string& quantity) {
+        for (const auto& t : s.traces()) {
+          if (t.receiver == receiver && t.quantity == quantity) {
+            return to_numpy(t.data, {static_cast<py::ssize_t>(t.data.size() / t.ncomp), t.ncomp});
+          }
+        }
+        throw Error("no trace '" + quantity + "' for receiver '" + receiver + "'");
+      }, py::arg("receiver"), py::arg("quantity"), "(n_samples, ncomp) recorded trace.")
+      .def_property_readonly("times", [](const solver::Solver& s) { return to_numpy(s.sample_times()); })
+      .def_property_readonly("energy", [](const solver::Solver& s) {
+        std::vector<double> e;
+        for (const auto& row : s.energy()) e.insert(e.end(), row.begin(), row.end());
+        return to_numpy(e, {static_cast<py::ssize_t>(s.energy().size()), 3});
+      }, "(n, 3) energy monitor samples: time, kinetic, potential.")
+      .def("write_results", &solver::Solver::write_results, py::arg("path"));
+
   // ---- simulation
   py::class_<Discretization>(m, "Discretization")
       .def(py::init([](int order, int uniform_level) { return Discretization{order, uniform_level}; }),
@@ -248,6 +379,43 @@ PYBIND11_MODULE(_core, m) {
       .def_property_readonly("geometry", &Simulation::geometry, py::return_value_policy::reference_internal)
       .def_property_readonly("gll", [](const Simulation& s) { return rule_to_tuple(s.gll()); })
       .def("geometry_kind_counts", &Simulation::geometry_kind_counts)
+      .def("set_material", &Simulation::set_material, py::arg("region"), py::arg("material"))
+      .def("set_boundary", [](Simulation& s, int tag, const std::string& type) {
+        s.set_boundary(tag, boundary_type_from_string(type));
+      }, py::arg("tag"), py::arg("type"), "type: 'free', 'rigid' or 'absorbing'.")
+      .def("add_source", &Simulation::add_source, py::arg("source"))
+      .def("clear_sources", &Simulation::clear_sources)
+      .def("add_receiver", [](Simulation& s, const std::string& name, double x, double z,
+                              std::vector<std::string> quantities) {
+        s.add_receiver({name, {x, z}, std::move(quantities)});
+      }, py::arg("name"), py::arg("x"), py::arg("z"), py::arg("quantities"))
+      .def("clear_receivers", &Simulation::clear_receivers)
+      .def("set_time", [](Simulation& s, int n_steps, double duration, double dt, double safety,
+                          int record_every, int energy_every) {
+        TimeConfig t;
+        t.n_steps = n_steps;
+        t.duration = duration;
+        t.dt = dt;
+        t.safety = safety;
+        t.record_every = record_every;
+        t.energy_every = energy_every;
+        s.set_time(t);
+      }, py::arg("n_steps") = 0, py::arg("duration") = 0.0, py::arg("dt") = 0.0, py::arg("safety") = 0.8,
+           py::arg("record_every") = 1, py::arg("energy_every") = 0,
+           "Time settings. dt = 0 picks safety * the estimated stability limit; n_steps = 0 derives it from duration.")
+      .def_property_readonly("materials", &Simulation::materials)
+      .def_property_readonly("boundaries", [](const Simulation& s) {
+        std::map<int, std::string> out;
+        for (const auto& [tag, type] : s.boundaries()) out[tag] = to_string(type);
+        return out;
+      })
+      .def_property_readonly("sources", &Simulation::sources)
+      .def_property_readonly("receivers", &Simulation::receivers)
+      .def_property_readonly("time", &Simulation::time)
+      .def_property_readonly("solver", &Simulation::solver, py::return_value_policy::reference_internal,
+                             "Time-stepping state, built on first access.")
+      .def("run", &Simulation::run, py::call_guard<py::gil_scoped_release>())
+      .def("write_results", &Simulation::write_results, py::arg("path"))
       .def("save", &Simulation::save, py::arg("path"))
       .def_static("load", &Simulation::load, py::arg("path"));
 }

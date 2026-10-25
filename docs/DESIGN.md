@@ -202,7 +202,13 @@ order m, and each mode is an independent 2D problem on the **same r–z mesh**:
 * `TimeIntegrator` interface acting on a semi-discrete coupled system
   `M ẍ = R(x, ẋ, t)`. The system object owns the physics ordering (§2.3) and the
   constraints (§6.3).
-* **v1:** explicit central difference (leapfrog), with Δt from a per-element CFL estimate.
+* **v1 (implemented):** explicit central difference (leapfrog). Δt defaults to
+  a safety factor (0.8) times the stability limit 2/√λ_max(M⁻¹K), with λ_max
+  estimated by power iteration at setup. Stacey damping is treated implicitly
+  in the velocity corrector, which is a 2×2 solve per boundary point. The
+  explicit form is only marginally stable when the boundary damping ratio is
+  O(1) at the CFL limit. The energy monitor reports the discrete energy the
+  scheme conserves exactly: ½v⁺·Mv⁻ + ½u·Ku = ½v·Mv − Δt²/8·a·Ma + ½u·Ku.
 * **Later:** low-storage Runge–Kutta (LDDRK) for C-PML auxiliary equations.
 * **Local time stepping (planned).** Each element gets a level ℓ with
   Δt_ℓ = Δt₀ / 2^ℓ from its own CFL limit. The integrator is the leapfrog-based
@@ -486,8 +492,8 @@ problems fit on one node or GPU; it becomes essential for 3D.
 
 | Milestone | Content | Verified by |
 |---|---|---|
-| **M0** Foundations | CMake + scikit-build, CI (CPU), GLL/GLJ basis, macro-mesh + forest data model (uniform refinement), leaf geometry and geometry kinds, dof map + deterministic gather/scatter, HDF5 I/O, Python bindings | unit tests |
-| **M1** 2D Cartesian core (CPU) | elastic + acoustic (pressure) element blocks, leapfrog, Stacey, free/rigid boundaries, forcings, point receivers, energy monitor, layered template, OpenMP | analytic 2D, Lamb, convergence, energy |
+| **M0** Foundations ✅ | CMake + scikit-build, CI (CPU), GLL/GLJ basis, macro-mesh + forest data model (uniform refinement), leaf geometry and geometry kinds, dof map + deterministic gather/scatter, HDF5 I/O, Python bindings | unit tests |
+| **M1** 2D Cartesian core (CPU) ✅ | elastic + acoustic (pressure) element blocks, leapfrog, Stacey, free/rigid boundaries, forcings, point receivers, energy monitor, layered template, OpenMP | analytic 2D Green's functions, Rayleigh speed (the full Lamb solution moves to M2), convergence, energy |
 | **M2** Coupling + refinement | fluid–solid coupling, adaptive quadtree + 2:1 balance + hanging nodes, Gmsh import, SEG-Y/XDMF, YAML | Scholte/reflection, refinement-interface reflection |
 | **M3** Axisymmetric monopole | axisym blocks (GLJ axis), borehole template (open/cased hole, beds), monopole source, DWM reference solver, STC post-processing | 3D analytic on axis, DWM open and cased hole |
 | **M4** Dipole (2.5D, m = 1) | azimuthal-mode blocks, mode-dependent axis conditions, dipole source and receivers, flexural dispersion tools | DWM dipole, flexural dispersion |

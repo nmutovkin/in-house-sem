@@ -27,6 +27,10 @@ class DofMap {
   // which keeps the numbering local along the space-filling curve.
   static DofMap build(const mesh::Forest& forest, int ngll);
 
+  // Same, restricted to the given leaves (e.g. the leaves of one physics
+  // domain). Element e of the map is leaf `leaves[e]`.
+  static DofMap build(const mesh::Forest& forest, int ngll, const std::vector<index_t>& leaves);
+
   int ngll() const { return ngll_; }
   int points_per_element() const { return npe_; }
   index_t n_elements() const { return n_elem_; }

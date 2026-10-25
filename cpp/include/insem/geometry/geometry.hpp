@@ -36,6 +36,12 @@ struct Geometry {
   std::vector<GeometryKind> kind;  // per element
 };
 
+// Mapping of one leaf from its reference square [-1, 1]^2 (the macro-cell
+// mapping restricted to the leaf box), and its Jacobian
+// {dx/dxi, dx/deta, dz/dxi, dz/deta} with respect to the leaf coordinates.
+std::array<double, 2> leaf_map(const mesh::Forest& forest, index_t leaf, double xi, double eta);
+std::array<double, 4> leaf_jacobian(const mesh::Forest& forest, index_t leaf, double xi, double eta);
+
 // Evaluates the leaf mappings (macro-cell mapping restricted to each leaf box)
 // at the tensor-product points ref_xi x ref_eta, each on [-1, 1] with
 // ngll entries.

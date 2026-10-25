@@ -10,11 +10,17 @@
 namespace insem::ops {
 
 DofMap DofMap::build(const mesh::Forest& forest, int ngll) {
+  std::vector<index_t> all(forest.n_leaves());
+  for (index_t l = 0; l < forest.n_leaves(); ++l) all[l] = l;
+  return build(forest, ngll, all);
+}
+
+DofMap DofMap::build(const mesh::Forest& forest, int ngll, const std::vector<index_t>& leaves) {
   INSEM_CHECK(ngll >= 2, "need at least 2 GLL points per direction, got " << ngll);
   DofMap d;
   d.ngll_ = ngll;
   d.npe_ = ngll * ngll;
-  d.n_elem_ = forest.n_leaves();
+  d.n_elem_ = static_cast<index_t>(leaves.size());
   const int n = ngll - 1;
   const std::size_t npe = static_cast<std::size_t>(d.npe_);
   const std::size_t n_slots = static_cast<std::size_t>(d.n_elem_) * npe;
@@ -36,7 +42,9 @@ DofMap DofMap::build(const mesh::Forest& forest, int ngll) {
   d.l2g_.assign(n_slots, -1);
   index_t next = 0;
   for (index_t e = 0; e < d.n_elem_; ++e) {
-    const index_t* v = &lv.corners[4 * static_cast<std::size_t>(e)];
+    const index_t leaf = leaves[e];
+    INSEM_CHECK(leaf >= 0 && leaf < forest.n_leaves(), "leaf index " << leaf << " out of range");
+    const index_t* v = &lv.corners[4 * static_cast<std::size_t>(leaf)];
     index_t edge_base[4];
     bool edge_forward[4];
     for (int f = 0; f < 4; ++f) {

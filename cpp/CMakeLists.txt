@@ -15,6 +15,11 @@ add_library(insem STATIC
   src/mesh/forest.cpp
   src/geometry/geometry.cpp
   src/ops/dof_map.cpp
+  src/ops/element_block.cpp
+  src/cpu/kernels.cpp
+  src/solver/locate.cpp
+  src/solver/solver.cpp
+  src/sim/description.cpp
   src/io/hdf5.cpp
   src/sim/simulation.cpp
 )

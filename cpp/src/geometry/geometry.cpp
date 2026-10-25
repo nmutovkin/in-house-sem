@@ -19,6 +19,21 @@ std::string to_string(GeometryKind kind) {
   return "unknown";
 }
 
+std::array<double, 2> leaf_map(const mesh::Forest& forest, index_t leaf, double xi, double eta) {
+  const auto box = forest.leaf_box(leaf);
+  return forest.macro().map(forest.leaf(leaf).tree, box[0] + (xi + 1.0) * 0.5 * (box[1] - box[0]),
+                            box[2] + (eta + 1.0) * 0.5 * (box[3] - box[2]));
+}
+
+std::array<double, 4> leaf_jacobian(const mesh::Forest& forest, index_t leaf, double xi, double eta) {
+  const auto box = forest.leaf_box(leaf);
+  const double hx = 0.5 * (box[1] - box[0]);
+  const double hy = 0.5 * (box[3] - box[2]);
+  const auto j = forest.macro().jacobian(forest.leaf(leaf).tree, box[0] + (xi + 1.0) * hx,
+                                         box[2] + (eta + 1.0) * hy);
+  return {j[0] * hx, j[1] * hy, j[2] * hx, j[3] * hy};
+}
+
 Geometry compute_geometry(const mesh::Forest& forest, const std::vector<double>& ref_xi,
                           const std::vector<double>& ref_eta) {
   INSEM_CHECK(ref_xi.size() == ref_eta.size() && ref_xi.size() >= 2,

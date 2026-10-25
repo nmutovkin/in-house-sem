@@ -10,6 +10,8 @@ add_executable(insem_tests
   test_geometry.cpp
   test_hdf5.cpp
   test_simulation.cpp
+  test_kernels.cpp
+  test_solver.cpp
 )
 target_link_libraries(insem_tests PRIVATE insem Catch2::Catch2WithMain)
 catch_discover_tests(insem_tests WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})

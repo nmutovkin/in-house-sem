@@ -9,18 +9,24 @@ The architecture, roadmap and open questions are in
 
 ## Status
 
-Milestone **M0 (foundations)** is done:
+Milestones **M0 (foundations)** and **M1 (2D Cartesian solver, CPU)** are done.
 
 | Area | What exists |
 |---|---|
-| Basis | GLL and GLJ(0,1) rules, Jacobi polynomials, Lagrange bases, derivative and interpolation matrices |
-| Mesh | macro-mesh (Quad4/Quad9, Cartesian or axisymmetric) with topology, validation and boundary tags; forest of quadtrees with uniform refinement in Morton order |
-| Geometry | leaf mappings, inverse Jacobians, geometry kinds (`rect`, `affine`, `curved`) |
-| Operators | dof map with deterministic gather/assemble (no atomics, no colouring) |
-| I/O | HDF5 wrapper; case files (`Simulation.save` / `Simulation.load`) |
-| Interfaces | C++ library, `insem-run` executable, Python package (`insem`) with a rectangle mesh template |
+| Physics | 2D isotropic elastic (P–SV) and acoustic (pressure formulation) in Cartesian coordinates, separate regions allowed (fluid–solid coupling is M2) |
+| Discretisation | GLL spectral elements of order 1–8; macro-mesh (Quad4/Quad9) + uniform quadtree refinement; element blocks by geometry kind (`rect`, `affine`, `curved`); deterministic assembly |
+| Time stepping | explicit central differences; stable Δt estimated by power iteration; discrete energy monitor (conserved to round-off) |
+| Boundaries | free / rigid / Stacey absorbing per boundary tag (Stacey damping treated implicitly per point, so it does not limit Δt) |
+| Sources | point force, moment tensor, acoustic monopole at arbitrary positions; Ricker, Gaussian, Gaussian derivative or sampled time functions |
+| Receivers | displacement, velocity, acceleration (elastic); pressure and particle velocity (acoustic), at arbitrary positions |
+| I/O | case files (full problem description), results files (traces, energy); `insem-run` |
+| Python | `insem` package mirroring the C++ objects; `rectangle` and `layered` (curved interfaces) templates |
 
-There is no physics yet. The 2D acoustic/elastic solver is milestone M1.
+Verification (`tests/python/test_verification.py`): 2D acoustic and elastic
+Green's functions (force, explosion, double couple) on straight and curved
+meshes, fluid particle velocity, spectral convergence of an eigenmode, the
+Rayleigh wave speed, Stacey absorption, and exact integrator identities.
+Typical errors are 0.1–1 %; see the test file for the numbers.
 
 ## Building
 
@@ -61,28 +67,31 @@ pytest
 import insem
 from insem import mesh
 
-# Axisymmetric (r, z) model with explicit radial breakpoints: borehole wall
-# at r = 0.1 m, casing to 0.11 m, cement to 0.15 m.
-m = mesh.rectangle([0.0, 0.1, 0.11, 0.15, 2.0], (0.0, 4.0), nz=20,
-                   coords="axisymmetric", quadratic=True)
-sim = insem.Simulation(m, insem.Discretization(order=4, uniform_level=1))
-sim.setup()
-print(sim.dofs.n_elements, sim.dofs.n_global, sim.geometry_kind_counts())
-sim.save("case.h5")
+m = mesh.rectangle((-4.0, 4.0), (-4.0, 4.0), nx=32, nz=32)
+sim = insem.Simulation(m, insem.Discretization(order=4))
+sim.set_material(0, insem.Material.acoustic(vp=1500.0, rho=1000.0))
+for tag in (mesh.BOTTOM, mesh.RIGHT, mesh.TOP, mesh.LEFT):
+    sim.set_boundary(tag, "absorbing")
+sim.add_source(insem.Source.monopole(0.0, 0.0, insem.ricker(400.0)))
+sim.add_receiver("h1", 1.5, 0.0, ["pressure"])
+sim.set_time(duration=4e-3)
+sim.run()
+pressure = sim.solver.trace("h1", "pressure")   # (n_samples, 1)
+sim.save("case.h5")                             # re-run with: insem-run case.h5
 ```
 
-```sh
-insem-run case.h5
-```
+`examples/layered_2d/run.py` is a fuller example: a two-layer elastic model
+with a curved interface, a double-couple source and a vertical receiver line.
 
 ## Layout
 
 ```
-cpp/include/insem/   public headers (basis, mesh, geometry, ops, io, sim)
-cpp/src/             implementation
+cpp/include/insem/   public headers (basis, mesh, geometry, ops, physics, solver, io, sim)
+cpp/src/             implementation (cpu/ holds the CPU element kernels)
 cpp/apps/            insem-run
 python/insem/        Python package; python/src/bindings.cpp is the pybind11 module
 tests/cpp/           Catch2 unit tests
 tests/python/        pytest tests
+examples/            runnable examples
 docs/                design documents
 ```
