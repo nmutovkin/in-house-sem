@@ -1,0 +1,29 @@
+# Hydrophone and geophone lines over and under a curved seabed.
+# Run with:  insem run examples/yaml/water_over_rock.yaml
+mesh:
+  layered:
+    x: [0, 800]
+    nx: 32
+    interfaces: [-400, "-150 + 30*sin(2*pi*x/800)", 200]
+    nz: [10, 8]
+    regions: [1, 2]
+    quadratic: true
+discretization:
+  order: 4
+  f_max: 40            # refine until 5 points per wavelength at 40 Hz
+materials:
+  1: {medium: elastic, vp: 2800, vs: 1400, rho: 2300}   # rock
+  2: {medium: acoustic, vp: 1500, rho: 1000}            # water
+boundaries: {bottom: absorbing, left: absorbing, right: absorbing, top: free}
+sources:
+  - {type: monopole, position: [400, 150], stf: {type: ricker, f0: 15}}
+receivers:
+  - {line: {start: [100, 100], end: [700, 100], n: 25}, prefix: h, quantities: [pressure]}
+  - {line: {start: [100, -250], end: [700, -250], n: 25}, prefix: g, quantities: [velocity]}
+time: {duration: 0.8, record_every: 4, snapshot_every: 100}
+output:
+  directory: water_over_rock_out
+  segy:
+    - {quantity: pressure, file: hydrophones.sgy, receivers: null}
+    - {quantity: velocity, component: z, file: geophones_z.sgy}
+  xdmf: true

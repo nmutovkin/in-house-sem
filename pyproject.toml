@@ -8,7 +8,10 @@ version = "0.1.0"
 description = "Spectral element simulator for coupled acoustic-elastic wave propagation (sonic logging)"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "h5py>=3.8"]
+dependencies = ["numpy>=1.24", "h5py>=3.8", "pyyaml>=6"]
+
+[project.scripts]
+insem = "insem.cli:main"
 
 [project.optional-dependencies]
 test = ["pytest>=7", "scipy>=1.10"]

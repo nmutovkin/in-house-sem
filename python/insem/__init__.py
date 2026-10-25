@@ -26,7 +26,7 @@ from ._core import (
     ricker,
     sampled_stf,
 )
-from . import basis, mesh, post
+from . import basis, config, mesh, post
 
 __all__ = [
     "Discretization",
@@ -44,6 +44,7 @@ __all__ = [
     "TimeConfig",
     "__version__",
     "basis",
+    "config",
     "gaussian",
     "gaussian_derivative",
     "global_coordinates",
