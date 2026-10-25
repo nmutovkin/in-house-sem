@@ -24,6 +24,41 @@ const Material& material_of_leaf(const Problem& p, index_t leaf) {
   return p.materials.at(region);
 }
 
+// Local (i, j) of point q (0..n) along face f, in counter-clockwise order.
+void face_point(int f, int q, int n, int& i, int& j) {
+  switch (f) {
+    case 0: i = q; j = 0; break;
+    case 1: i = n; j = q; break;
+    case 2: i = n - q; j = n; break;
+    default: i = 0; j = n - q; break;
+  }
+}
+
+// Quadrature weight times surface Jacobian, and outward unit normal, of
+// point q of face f of a leaf (pt = the point's index in the geometry arrays).
+void face_measure(const geometry::Geometry& geom, std::size_t pt, int f, double weight, double& w, double& nx,
+                  double& nz) {
+  // Tangent in counter-clockwise direction from the stored inverse metric:
+  // x_xi = eta_z J, z_xi = -eta_x J, x_eta = -xi_z J, z_eta = xi_x J.
+  const double jac = geom.jac[pt];
+  double tx, tz;
+  if (f == 0 || f == 2) {
+    tx = geom.eta_z[pt] * jac;
+    tz = -geom.eta_x[pt] * jac;
+  } else {
+    tx = -geom.xi_z[pt] * jac;
+    tz = geom.xi_x[pt] * jac;
+  }
+  if (f >= 2) {
+    tx = -tx;
+    tz = -tz;
+  }
+  const double ds = std::hypot(tx, tz);
+  w = weight * ds;
+  nx = tz / ds;
+  nz = -tx / ds;
+}
+
 template <class T>
 double dot(const std::vector<T>& a, const std::vector<T>& b) {
   double s = 0.0;
@@ -48,6 +83,7 @@ Solver::Solver(const Problem& p)
 
   build_domains(p);
   for (Domain& d : domains_) build_boundaries(p, d);
+  build_coupling(p);
   build_sources(p);
   build_receivers(p);
 
@@ -74,14 +110,6 @@ void Solver::build_domains(const Problem& p) {
     INSEM_CHECK(it != p.materials.end(), "no material assigned to region " << macro.material(c));
     it->second.validate();
   }
-  for (index_t e = 0; e < macro.n_edges(); ++e) {
-    const auto cells = macro.edge_cells(e);
-    if (cells[1] < 0) continue;
-    INSEM_CHECK(p.materials.at(macro.material(cells[0])).medium == p.materials.at(macro.material(cells[1])).medium,
-                "cells " << cells[0] << " and " << cells[1]
-                         << " form a fluid-solid interface; fluid-solid coupling is milestone M2");
-  }
-
   const int ngll = p.gll.size();
   const std::size_t npe = static_cast<std::size_t>(ngll) * ngll;
   for (Medium medium : {Medium::Acoustic, Medium::Elastic}) {
@@ -174,38 +202,15 @@ void Solver::build_boundaries(const Problem& p, Domain& d) {
       if (type != BoundaryType::Absorbing && !is_dirichlet) continue;
       for (int q = 0; q <= n; ++q) {
         int i, j;
-        switch (f) {
-          case 0: i = q; j = 0; break;
-          case 1: i = n; j = q; break;
-          case 2: i = n - q; j = n; break;
-          default: i = 0; j = n - q; break;
-        }
+        face_point(f, q, n, i, j);
         const int k = j * ngll + i;
         const index_t g = d.dofs.global_index(static_cast<index_t>(e), k);
         if (is_dirichlet) {
           dirichlet.insert(g);
           continue;
         }
-        // Tangent along the face in counter-clockwise direction, from the
-        // stored inverse metric: x_xi = eta_z J, z_xi = -eta_x J,
-        // x_eta = -xi_z J, z_eta = xi_x J.
-        const std::size_t pt = static_cast<std::size_t>(leaf) * npe + k;
-        const double jac = geom.jac[pt];
-        double tx, tz;
-        if (f == 0 || f == 2) {
-          tx = geom.eta_z[pt] * jac;
-          tz = -geom.eta_x[pt] * jac;
-        } else {
-          tx = -geom.xi_z[pt] * jac;
-          tz = geom.xi_x[pt] * jac;
-        }
-        if (f >= 2) {
-          tx = -tx;
-          tz = -tz;
-        }
-        const double ds = std::hypot(tx, tz);
-        const double w = p.gll.weights[q] * ds;
-        const double nx = tz / ds, nz = -tx / ds;  // outward normal
+        double w, nx, nz;
+        face_measure(geom, static_cast<std::size_t>(leaf) * npe + k, f, p.gll.weights[q], w, nx, nz);
         auto& acc = absorbing[g];
         if (d.medium == Medium::Elastic) {
           double cxx, czz, cxz;
@@ -226,6 +231,70 @@ void Solver::build_boundaries(const Problem& p, Domain& d) {
     for (int s = 0; s < stride; ++s) d.absorbing_coef.push_back(static_cast<real_t>(c[s]));
   }
   d.dirichlet_points.assign(dirichlet.begin(), dirichlet.end());
+}
+
+void Solver::build_coupling(const Problem& p) {
+  const int fi = domain_index(Medium::Acoustic);
+  const int si = domain_index(Medium::Elastic);
+  if (fi < 0 || si < 0) return;
+  const Domain& fluid = domains_[fi];
+  const Domain& solid = domains_[si];
+  const int ngll = p.gll.size();
+  const int n = ngll - 1;
+  const std::size_t npe = static_cast<std::size_t>(ngll) * ngll;
+  const mesh::LeafVertices lv = p.forest.leaf_vertices();
+  auto edge_key = [](index_t a, index_t b) {
+    return (static_cast<std::uint64_t>(std::min(a, b)) << 32) | static_cast<std::uint32_t>(std::max(a, b));
+  };
+  // Faces of solid elements by their leaf edge.
+  std::map<std::uint64_t, std::pair<index_t, int>> solid_faces;
+  for (std::size_t e = 0; e < solid.leaves.size(); ++e) {
+    const index_t* v = &lv.corners[4 * static_cast<std::size_t>(solid.leaves[e])];
+    for (int f = 0; f < 4; ++f) {
+      solid_faces[edge_key(v[mesh::kFaceCorners[f][0]], v[mesh::kFaceCorners[f][1]])] = {static_cast<index_t>(e), f};
+    }
+  }
+  // Interface points, keyed by fluid global point; faces meeting at a point
+  // add up their weighted normals.
+  struct Entry {
+    index_t solid_point;
+    double cx, cz;
+  };
+  std::map<index_t, Entry> entries;
+  for (std::size_t e = 0; e < fluid.leaves.size(); ++e) {
+    const index_t leaf = fluid.leaves[e];
+    const index_t* v = &lv.corners[4 * static_cast<std::size_t>(leaf)];
+    for (int f = 0; f < 4; ++f) {
+      const index_t a = v[mesh::kFaceCorners[f][0]], b = v[mesh::kFaceCorners[f][1]];
+      const auto it = solid_faces.find(edge_key(a, b));
+      if (it == solid_faces.end()) continue;
+      const auto [es, fs] = it->second;
+      const index_t* vs = &lv.corners[4 * static_cast<std::size_t>(solid.leaves[es])];
+      const bool solid_forward = vs[mesh::kFaceCorners[fs][0]] < vs[mesh::kFaceCorners[fs][1]];
+      for (int q = 0; q <= n; ++q) {
+        int i, j;
+        face_point(f, q, n, i, j);
+        const int k = j * ngll + i;
+        const int pos = a < b ? q : n - q;  // canonical position along the edge
+        int is, js;
+        face_point(fs, solid_forward ? pos : n - pos, n, is, js);
+        const index_t gf = fluid.dofs.global_index(static_cast<index_t>(e), k);
+        const index_t gs = solid.dofs.global_index(es, js * ngll + is);
+        double w, nx, nz;
+        face_measure(p.geometry, static_cast<std::size_t>(leaf) * npe + k, f, p.gll.weights[q], w, nx, nz);
+        auto [entry, inserted] = entries.try_emplace(gf, Entry{gs, 0.0, 0.0});
+        INSEM_CHECK(entry->second.solid_point == gs, "inconsistent fluid-solid interface point");
+        entry->second.cx += w * nx;
+        entry->second.cz += w * nz;
+      }
+    }
+  }
+  for (const auto& [gf, en] : entries) {
+    coupling_.fluid_points.push_back(gf);
+    coupling_.solid_points.push_back(en.solid_point);
+    coupling_.cx.push_back(static_cast<real_t>(en.cx));
+    coupling_.cz.push_back(static_cast<real_t>(en.cz));
+  }
 }
 
 int Solver::domain_index(Medium m) const {
@@ -282,11 +351,13 @@ void Solver::build_receivers(const Problem& p) {
     term.position = rec.position;
     std::optional<PointLocation> loc;
     for (std::size_t di = 0; di < domains_.size() && !loc; ++di) {
+      if (!rec.medium.empty() && to_string(domains_[di].medium) != rec.medium) continue;
       loc = locate(p.forest, p.geometry, rec.position, domains_[di].leaves);
       if (loc) term.domain = static_cast<int>(di);
     }
     INSEM_CHECK(loc, "receiver '" << rec.name << "' at (" << rec.position[0] << ", " << rec.position[1]
-                                  << ") is outside the model");
+                                  << ") is outside the " << (rec.medium.empty() ? "" : rec.medium + " part of the ")
+                                  << "model");
     const Domain& d = domains_[term.domain];
     const PointWeights w = point_weights(p.forest, lagrange_, *loc);
     const index_t e = d.element_of_leaf[loc->leaf];
@@ -359,65 +430,152 @@ double Solver::estimate_stable_dt() {
     }
     std::fill(d.f.begin(), d.f.end(), real_t(0));
   }
+  if (!coupling_.fluid_points.empty()) lambda = std::max(lambda, coupled_lambda_max(rng));
   INSEM_CHECK(lambda > 0.0, "could not estimate the stable time step (empty or rigid model?)");
   return 2.0 / std::sqrt(lambda);
 }
 
-void Solver::compute_acceleration(double t, bool energy, bool damping_implicit) {
-  potential_ = 0.0;
-  for (Domain& d : domains_) potential_ -= 0.5 * internal_forces(d, d.u, energy);
-
-  for (const SourceTerm& s : sources_) {
-    Domain& d = domains_[s.domain];
-    const real_t amp = static_cast<real_t>(s.stf(t));
+double Solver::coupled_lambda_max(std::mt19937& rng) {
+  // The coupled operator x -> -a(x) is not symmetric, so its spectral radius
+  // is estimated from the growth of the mass-weighted norm under power
+  // iteration (no sources, no damping). The domain fields are restored.
+  Domain& solid = domains_[domain_index(Medium::Elastic)];
+  Domain& fluid = domains_[domain_index(Medium::Acoustic)];
+  const auto saved_su = solid.u, saved_fu = fluid.u, saved_sa = solid.a, saved_fa = fluid.a;
+  std::uniform_real_distribution<double> dist(-1.0, 1.0);
+  for (auto& v : solid.u) v = static_cast<real_t>(dist(rng));
+  for (auto& v : fluid.u) v = static_cast<real_t>(dist(rng));
+  auto mass_norm2 = [](const Domain& d, const std::vector<real_t>& x) {
     const std::size_t ng = static_cast<std::size_t>(d.n_global());
-    const std::size_t np = s.points.size();
+    double s = 0.0;
     for (int c = 0; c < d.ncomp; ++c) {
-      for (std::size_t i = 0; i < np; ++i) d.f[c * ng + s.points[i]] += s.coef[c * np + i] * amp;
+      for (std::size_t g = 0; g < ng; ++g) s += static_cast<double>(d.mass[g]) * x[c * ng + g] * x[c * ng + g];
+    }
+    return s;
+  };
+  double lambda = 0.0;
+  for (int it = 0; it < 120; ++it) {
+    for (Domain* d : {&solid, &fluid}) {
+      const std::size_t ng = static_cast<std::size_t>(d->n_global());
+      for (int c = 0; c < d->ncomp; ++c) {
+        for (index_t g : d->dirichlet_points) d->u[c * ng + g] = 0;
+      }
+    }
+    const double nx = mass_norm2(solid, solid.u) + mass_norm2(fluid, fluid.u);
+    for (Domain* d : {&solid, &fluid}) {
+      internal_forces(*d, d->u, false);
+      add_coupling_forces(*d);
+      const std::size_t ng = static_cast<std::size_t>(d->n_global());
+      for (int c = 0; c < d->ncomp; ++c) {
+        for (std::size_t g = 0; g < ng; ++g) d->a[c * ng + g] = d->f[c * ng + g] * d->inv_mass[g];
+        for (index_t g : d->dirichlet_points) d->a[c * ng + g] = 0;
+      }
+    }
+    const double ny = mass_norm2(solid, solid.a) + mass_norm2(fluid, fluid.a);
+    if (nx <= 0.0 || ny <= 0.0) break;
+    if (it >= 60) lambda = std::max(lambda, std::sqrt(ny / nx));
+    const double scale = -1.0 / std::sqrt(ny);
+    for (Domain* d : {&solid, &fluid}) {
+      for (std::size_t i = 0; i < d->u.size(); ++i) d->u[i] = static_cast<real_t>(d->a[i] * scale);
     }
   }
+  solid.u = saved_su;
+  fluid.u = saved_fu;
+  solid.a = saved_sa;
+  fluid.a = saved_fa;
+  std::fill(solid.f.begin(), solid.f.end(), real_t(0));
+  std::fill(fluid.f.begin(), fluid.f.end(), real_t(0));
+  return lambda;
+}
 
-  for (Domain& d : domains_) {
+void Solver::compute_acceleration(double t, bool energy, bool damping_implicit) {
+  // The solid is solved first: its coupling traction needs the current
+  // pressure, while the fluid's coupling term needs the new solid
+  // acceleration (docs/DESIGN.md §2.3).
+  potential_ = 0.0;
+  for (Medium medium : {Medium::Elastic, Medium::Acoustic}) {
+    const int di = domain_index(medium);
+    if (di < 0) continue;
+    Domain& d = domains_[di];
+    potential_ -= 0.5 * internal_forces(d, d.u, energy);
+    for (const SourceTerm& s : sources_) {
+      if (s.domain != di) continue;
+      const real_t amp = static_cast<real_t>(s.stf(t));
+      const std::size_t ng = static_cast<std::size_t>(d.n_global());
+      const std::size_t np = s.points.size();
+      for (int c = 0; c < d.ncomp; ++c) {
+        for (std::size_t i = 0; i < np; ++i) d.f[c * ng + s.points[i]] += s.coef[c * np + i] * amp;
+      }
+    }
+    add_coupling_forces(d);
+    solve_acceleration(d, damping_implicit);
+  }
+}
+
+void Solver::add_coupling_forces(Domain& d) {
+  const std::size_t n = coupling_.fluid_points.size();
+  if (n == 0) return;
+  if (d.medium == Medium::Elastic) {
+    // Traction p n_f on the solid.
+    const Domain& fluid = domains_[domain_index(Medium::Acoustic)];
     const std::size_t ng = static_cast<std::size_t>(d.n_global());
-    const int ncomp = d.ncomp;
-    const real_t* inv_mass = d.inv_mass.data();
-    const real_t* f = d.f.data();
-    real_t* a = d.a.data();
-#pragma omp parallel for schedule(static)
-    for (std::int64_t g = 0; g < static_cast<std::int64_t>(ng); ++g) {
-      for (int c = 0; c < ncomp; ++c) a[c * ng + g] = f[c * ng + g] * inv_mass[g];
+    for (std::size_t i = 0; i < n; ++i) {
+      const real_t p = fluid.u[coupling_.fluid_points[i]];
+      const std::size_t g = coupling_.solid_points[i];
+      d.f[g] += coupling_.cx[i] * p;
+      d.f[ng + g] += coupling_.cz[i] * p;
     }
+  } else {
+    // -n_f . a_s on the fluid.
+    const Domain& solid = domains_[domain_index(Medium::Elastic)];
+    const std::size_t ngs = static_cast<std::size_t>(solid.n_global());
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::size_t gs = coupling_.solid_points[i];
+      d.f[coupling_.fluid_points[i]] -= coupling_.cx[i] * solid.a[gs] + coupling_.cz[i] * solid.a[ngs + gs];
+    }
+  }
+}
 
-    // Stacey points: the damping force -C v uses v^{n+1} = v^{n+1/2} + dt/2 a,
-    // i.e. (M + dt/2 C) a = f - C v^{n+1/2}, solved per point (C is 2x2 or
-    // scalar). Treating the damping implicitly keeps it unconditionally
-    // stable; at t = 0 the velocity is known and the term is explicit.
-    const double h = damping_implicit ? 0.5 * dt_ : 0.0;
-    const std::size_t nabs = d.absorbing_points.size();
-    if (d.medium == Medium::Elastic) {
-      for (std::size_t i = 0; i < nabs; ++i) {
-        const std::size_t g = d.absorbing_points[i];
-        const double cxx = d.absorbing_coef[3 * i], czz = d.absorbing_coef[3 * i + 1],
-                     cxz = d.absorbing_coef[3 * i + 2];
-        const double vx = d.v[g], vz = d.v[ng + g];
-        const double rx = d.f[g] - (cxx * vx + cxz * vz);
-        const double rz = d.f[ng + g] - (cxz * vx + czz * vz);
-        const double m = d.mass[g];
-        const double a11 = m + h * cxx, a22 = m + h * czz, a12 = h * cxz;
-        const double det = a11 * a22 - a12 * a12;
-        d.a[g] = static_cast<real_t>((a22 * rx - a12 * rz) / det);
-        d.a[ng + g] = static_cast<real_t>((a11 * rz - a12 * rx) / det);
-      }
-    } else {
-      for (std::size_t i = 0; i < nabs; ++i) {
-        const std::size_t g = d.absorbing_points[i];
-        const double c = d.absorbing_coef[i];
-        d.a[g] = static_cast<real_t>((d.f[g] - c * d.v[g]) / (d.mass[g] + h * c));
-      }
+void Solver::solve_acceleration(Domain& d, bool damping_implicit) {
+  const std::size_t ng = static_cast<std::size_t>(d.n_global());
+  const int ncomp = d.ncomp;
+  const real_t* inv_mass = d.inv_mass.data();
+  const real_t* f = d.f.data();
+  real_t* a = d.a.data();
+#pragma omp parallel for schedule(static)
+  for (std::int64_t g = 0; g < static_cast<std::int64_t>(ng); ++g) {
+    for (int c = 0; c < ncomp; ++c) a[c * ng + g] = f[c * ng + g] * inv_mass[g];
+  }
+
+  // Stacey points: the damping force -C v uses v^{n+1} = v^{n+1/2} + dt/2 a,
+  // i.e. (M + dt/2 C) a = f - C v^{n+1/2}, solved per point (C is 2x2 or
+  // scalar). Treating the damping implicitly keeps it unconditionally
+  // stable; at t = 0 the velocity is known and the term is explicit.
+  const double h = damping_implicit ? 0.5 * dt_ : 0.0;
+  const std::size_t nabs = d.absorbing_points.size();
+  if (d.medium == Medium::Elastic) {
+    for (std::size_t i = 0; i < nabs; ++i) {
+      const std::size_t g = d.absorbing_points[i];
+      const double cxx = d.absorbing_coef[3 * i], czz = d.absorbing_coef[3 * i + 1],
+                   cxz = d.absorbing_coef[3 * i + 2];
+      const double vx = d.v[g], vz = d.v[ng + g];
+      const double rx = d.f[g] - (cxx * vx + cxz * vz);
+      const double rz = d.f[ng + g] - (cxz * vx + czz * vz);
+      const double m = d.mass[g];
+      const double a11 = m + h * cxx, a22 = m + h * czz, a12 = h * cxz;
+      const double det = a11 * a22 - a12 * a12;
+      d.a[g] = static_cast<real_t>((a22 * rx - a12 * rz) / det);
+      d.a[ng + g] = static_cast<real_t>((a11 * rz - a12 * rx) / det);
     }
-    for (int c = 0; c < ncomp; ++c) {
-      for (index_t g : d.dirichlet_points) d.a[c * ng + g] = 0;
+  } else {
+    for (std::size_t i = 0; i < nabs; ++i) {
+      const std::size_t g = d.absorbing_points[i];
+      const double c = d.absorbing_coef[i];
+      d.a[g] = static_cast<real_t>((d.f[g] - c * d.v[g]) / (d.mass[g] + h * c));
     }
+  }
+  for (int c = 0; c < ncomp; ++c) {
+    for (index_t g : d.dirichlet_points) d.a[c * ng + g] = 0;
   }
 }
 

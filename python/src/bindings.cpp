@@ -296,7 +296,8 @@ PYBIND11_MODULE(_core, m) {
   py::class_<Receiver>(m, "Receiver")
       .def_readonly("name", &Receiver::name)
       .def_readonly("position", &Receiver::position)
-      .def_readonly("quantities", &Receiver::quantities);
+      .def_readonly("quantities", &Receiver::quantities)
+      .def_readonly("medium", &Receiver::medium);
 
   py::class_<TimeConfig>(m, "TimeConfig")
       .def_readonly("dt", &TimeConfig::dt)
@@ -386,9 +387,10 @@ PYBIND11_MODULE(_core, m) {
       .def("add_source", &Simulation::add_source, py::arg("source"))
       .def("clear_sources", &Simulation::clear_sources)
       .def("add_receiver", [](Simulation& s, const std::string& name, double x, double z,
-                              std::vector<std::string> quantities) {
-        s.add_receiver({name, {x, z}, std::move(quantities)});
-      }, py::arg("name"), py::arg("x"), py::arg("z"), py::arg("quantities"))
+                              std::vector<std::string> quantities, const std::string& medium) {
+        s.add_receiver({name, {x, z}, std::move(quantities), medium});
+      }, py::arg("name"), py::arg("x"), py::arg("z"), py::arg("quantities"), py::arg("medium") = "",
+           "medium ('acoustic' / 'elastic') picks the side of a receiver on a fluid-solid interface.")
       .def("clear_receivers", &Simulation::clear_receivers)
       .def("set_time", [](Simulation& s, int n_steps, double duration, double dt, double safety,
                           int record_every, int energy_every) {

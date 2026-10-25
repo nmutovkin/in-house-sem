@@ -201,3 +201,71 @@ def test_curved_layered_mesh_of_a_homogeneous_medium():
     s = sim.solver
     ua = analytic.elastic_displacement(s.times, stf(s.times), xr, zr, vp, vs, rho, force=(0.3, 1.0))
     assert analytic.rel_l2(s.trace("r", "displacement"), ua) < 0.01
+
+
+def test_fluid_solid_normal_incidence_reflection_and_transmission():
+    # Downgoing plane pressure pulse in a fluid over a solid. The fluid side
+    # walls are rigid (natural), so the wave stays planar; receivers sit on
+    # the axis, away from the solid's side edges for the measured window.
+    vf, rf, vp, vs, rs = 1.5, 1.0, 3.0, 1.6, 2.2
+    m = mesh.layered((-4, 4), [-4.0, 0.0, 4.0], nz=[24, 24], regions=[1, 2], nx=24)
+    sim = insem.Simulation(m, insem.Discretization(order=4))
+    sim.set_material(1, insem.Material.elastic(vp, vs, rs))
+    sim.set_material(2, insem.Material.acoustic(vf, rf))
+    sim.set_boundary(mesh.TOP, "absorbing")
+    sim.set_boundary(mesh.BOTTOM, "absorbing")
+    sim.add_receiver("fluid", 0.0, 1.0, ["pressure"])
+    sim.add_receiver("solid", 0.0, -1.0, ["velocity"])
+    sim.set_time(duration=2.4)
+    s = sim.solver
+    xz = s.coordinates("acoustic")
+    sigma = 0.15
+    f = np.exp(-((xz[1] - 2.0) ** 2) / (2 * sigma**2))
+    s.set_state("acoustic", f[None], (vf * -(xz[1] - 2.0) / sigma**2 * f)[None])
+    s.run()
+    t = s.times
+    p = s.trace("fluid", "pressure")[:, 0]
+    v = s.trace("solid", "velocity")[:, 1]
+
+    def peak(x):
+        return x[np.argmax(np.abs(x))]
+
+    incident = peak(p[t < 1.2])
+    zf, zs = rf * vf, rs * vp
+    assert peak(p[(t > 1.7) & (t < 2.3)]) / incident == pytest.approx((zs - zf) / (zs + zf), rel=0.01)
+    assert peak(v[(t > 1.4) & (t < 2.0)]) / incident == pytest.approx(-2 / (zs + zf), rel=0.01)
+
+
+def test_scholte_wave_speed():
+    # Soft solid (vs < vf) under a fluid: the interface wave travels slower
+    # than both the solid's Rayleigh wave and the fluid wave.
+    from scipy.optimize import brentq
+
+    vf, rf, vp, vs, rs = 1.5, 1.0, 2.0, 0.8, 1.8
+    k = (vs / vp) ** 2
+
+    def scholte(c):
+        x = c / vs
+        return ((2 - x * x) ** 2 - 4 * np.sqrt(1 - k * x * x) * np.sqrt(1 - x * x)
+                + (rf / rs) * x**4 * np.sqrt(1 - k * x * x) / np.sqrt(1 - (c / vf) ** 2))
+
+    expected = brentq(scholte, 0.3 * vs, 0.99999 * vs)
+    m = mesh.layered((-8, 8), [-6.0, 0.0, 6.0], nz=[24, 24], regions=[1, 2], nx=64)
+    sim = insem.Simulation(m, insem.Discretization(order=4))
+    sim.set_material(1, insem.Material.elastic(vp, vs, rs))
+    sim.set_material(2, insem.Material.acoustic(vf, rf))
+    for tag in (mesh.TOP, mesh.BOTTOM, mesh.LEFT, mesh.RIGHT):
+        sim.set_boundary(tag, "absorbing")
+    sim.add_source(insem.Source.force(0.0, -0.05, 0.0, 1.0, insem.ricker(1.0)))
+    sim.add_receiver("near", 2.0, 0.0, ["velocity"], medium="elastic")
+    sim.add_receiver("far", 5.0, 0.0, ["velocity"], medium="elastic")
+    sim.set_time(duration=10.0)
+    sim.run()
+    s = sim.solver
+    a = s.trace("near", "velocity")[:, 1]
+    b = s.trace("far", "velocity")[:, 1]
+    cc = np.correlate(b, a, "full")
+    i = int(np.argmax(cc))
+    frac = 0.5 * (cc[i - 1] - cc[i + 1]) / (cc[i - 1] - 2 * cc[i] + cc[i + 1])
+    lag = (i + frac - (len(a) - 1)) * (s.times[1] - s.times[0])
+    assert 3.0 / lag == pytest.approx(expected, rel=0.01)  # 0.16 %

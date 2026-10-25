@@ -77,6 +77,7 @@ void Simulation::add_receiver(const Receiver& receiver) {
     INSEM_CHECK(r.name != receiver.name, "duplicate receiver name '" << receiver.name << "'");
   }
   INSEM_CHECK(!receiver.quantities.empty(), "receiver '" << receiver.name << "' records no quantities");
+  if (!receiver.medium.empty()) medium_from_string(receiver.medium);  // validates
   receivers_.push_back(receiver);
   invalidate_solver();
 }
@@ -213,6 +214,7 @@ void Simulation::save(const std::string& path) const {
     f.write(g + "/position", std::vector<double>{r.position[0], r.position[1]});
     f.set_attribute(g, "name", r.name);
     f.set_attribute(g, "quantities", join(r.quantities));
+    f.set_attribute(g, "medium", r.medium);
   }
 
   f.create_group("/time");
@@ -318,7 +320,8 @@ Simulation Simulation::load(const std::string& path) {
       const std::string g = "/receivers/" + std::to_string(i);
       const auto pos = f.read<double>(g + "/position");
       INSEM_CHECK(pos.size() == 2, "malformed receiver " << i);
-      sim.add_receiver({f.attribute_string(g, "name"), {pos[0], pos[1]}, split(f.attribute_string(g, "quantities"))});
+      sim.add_receiver({f.attribute_string(g, "name"), {pos[0], pos[1]}, split(f.attribute_string(g, "quantities")),
+                        f.has_attribute(g, "medium") ? f.attribute_string(g, "medium") : std::string()});
     }
   }
   if (f.exists("/time")) {

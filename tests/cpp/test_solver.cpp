@@ -140,14 +140,35 @@ TEST_CASE("Stability limit is respected and enforced", "[solver]") {
   CHECK_THROWS_AS(sim.solver(), insem::Error);
 }
 
-TEST_CASE("Fluid-solid interfaces are rejected until M2", "[solver]") {
+TEST_CASE("Fluid-solid interfaces are found and run stably", "[solver][coupling]") {
+  // Fluid cell on the left, solid cell on the right, interface x = 0.5.
   auto m = test::grid(2, 1);
   auto mixed = std::make_shared<const mesh::MacroMesh>(m->cell_type(), m->coord_system(), m->nodes(), m->cells(),
                                                        std::vector<int>{0, 1}, m->boundary());
-  Simulation sim(mixed, {3, 0});
+  Simulation sim(mixed, {3, 1});
   sim.set_material(0, Material::acoustic(1.5, 1.0));
   sim.set_material(1, Material::elastic(3.0, 1.5, 2.0));
-  CHECK_THROWS_WITH(sim.solver(), Catch::Matchers::ContainsSubstring("fluid-solid"));
+  sim.add_source(Source::monopole(0.25, 0.5, SourceTimeFunction::ricker(4.0)));
+  sim.add_receiver({"solid side", {0.5, 0.5}, {"velocity"}, "elastic"});
+  sim.add_receiver({"fluid side", {0.5, 0.5}, {"pressure"}, "acoustic"});
+  TimeConfig t;
+  t.duration = 2.0;
+  sim.set_time(t);
+  auto& s = sim.solver();
+  REQUIRE(s.n_domains() == 2);
+  s.run();
+  const auto& traces = s.traces();
+  double vmax = 0.0, pmax = 0.0;
+  for (double v : traces[0].data) {
+    REQUIRE(std::isfinite(v));
+    vmax = std::max(vmax, std::abs(v));
+  }
+  for (double p : traces[1].data) {
+    REQUIRE(std::isfinite(p));
+    pmax = std::max(pmax, std::abs(p));
+  }
+  CHECK(vmax > 0.0);  // the fluid source moved the solid
+  CHECK(pmax > 0.0);
 }
 
 TEST_CASE("Sources and receivers outside their medium fail clearly", "[solver]") {

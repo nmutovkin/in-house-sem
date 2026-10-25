@@ -95,10 +95,13 @@ struct Source {
 // Recorded quantities:
 //   elastic:  "displacement", "velocity", "acceleration"   (2 components: x, z)
 //   acoustic: "pressure" (1 component), "particle_velocity" (2 components)
+// `medium` ("acoustic", "elastic" or empty for either) selects the side of a
+// receiver placed on a fluid-solid interface.
 struct Receiver {
   std::string name;
   std::array<double, 2> position{0.0, 0.0};
   std::vector<std::string> quantities;
+  std::string medium;
 };
 
 // Number of components of a recorded quantity; throws for unknown names or

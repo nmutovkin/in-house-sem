@@ -2,6 +2,7 @@
 
 #include <array>
 #include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -59,7 +60,9 @@ struct Problem {
 };
 
 // Explicit central-difference time stepping of the semi-discrete system
-// M a = f_int(u) + f_src(t) - C v, per domain (docs/DESIGN.md §3.2).
+// M a = f_int(u) + f_src(t) - C v, per domain (docs/DESIGN.md §3.2), with
+// fluid-solid coupling: the solid feels the traction p n_f, the fluid the
+// normal acceleration -n_f . a_s, so each step solves the solid first.
 //   u^{n+1}   = u^n + dt v^n + dt^2/2 a^n
 //   v^{n+1/2} = v^n + dt/2 a^n
 //   a^{n+1}   = M^-1 [f_int(u^{n+1}) + f_src(t^{n+1}) - C v^{n+1}]
@@ -135,10 +138,15 @@ class Solver {
   void build_sources(const Problem& p);
   void build_receivers(const Problem& p);
   double estimate_stable_dt();
+  double coupled_lambda_max(std::mt19937& rng);
 
   // f_int(u) into d.f; returns u . f_int when `energy` is set.
   double internal_forces(Domain& d, const std::vector<real_t>& u, bool energy);
+  void build_coupling(const Problem& p);
   void compute_acceleration(double t, bool energy, bool damping_implicit);
+  void add_coupling_forces(Domain& d);
+  // a = M^-1 f with the Stacey and Dirichlet conditions.
+  void solve_acceleration(Domain& d, bool damping_implicit);
   double kinetic_energy() const;
   void initialize();
   void record();
@@ -148,6 +156,12 @@ class Solver {
   std::vector<Domain> domains_;
   std::vector<SourceTerm> sources_;
   std::vector<ReceiverTerm> receivers_;
+  // Fluid-solid interface points: fluid and solid global indices and the
+  // quadrature weight times the outward fluid normal (summed over faces).
+  struct Coupling {
+    std::vector<index_t> fluid_points, solid_points;
+    std::vector<real_t> cx, cz;
+  } coupling_;
   std::vector<Trace> traces_;
   std::vector<double> sample_times_;
   std::vector<std::array<double, 3>> energy_;
