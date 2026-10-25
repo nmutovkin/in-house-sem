@@ -97,8 +97,14 @@ insem info water_over_rock_out/case.h5
 insem-run water_over_rock_out/case.h5          # C++ executable, no Python needed
 ```
 
-`examples/layered_2d/run.py` is a fuller Python example: a two-layer elastic
-model with a curved interface, a double-couple source and a receiver line.
+More examples:
+
+| Example | What it shows |
+|---|---|
+| `examples/layered_2d/run.py` | two-layer elastic model with a curved interface, double-couple source, receiver line |
+| `examples/gmsh_seabed/run.py` | Gmsh mesh (curved seabed, buried lens), wavelength-based refinement, fluid–solid coupling, snapshot and gather plots; `make_mesh.py` regenerates the mesh with Gmsh |
+| `examples/verification/plot_verification.py` | SEM against Lamb's problem and the analytic double-couple solution |
+| `examples/yaml/water_over_rock.yaml` | the same kind of model as a YAML configuration |
 
 ## Layout
 
