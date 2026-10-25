@@ -1,5 +1,6 @@
 #include "insem/mesh/forest.hpp"
 
+#include <algorithm>
 #include <unordered_map>
 #include <utility>
 
@@ -75,7 +76,144 @@ std::int32_t compact_bits(std::uint64_t m) {
 }  // namespace
 
 Forest::Forest(std::shared_ptr<const MacroMesh> macro, std::vector<Leaf> leaves)
-    : macro_(std::move(macro)), leaves_(std::move(leaves)) {}
+    : macro_(std::move(macro)), leaves_(std::move(leaves)) {
+  index_.reserve(leaves_.size());
+  for (std::size_t l = 0; l < leaves_.size(); ++l) {
+    const Leaf& lf = leaves_[l];
+    index_[key(lf.tree, lf.level, lf.i, lf.j)] = static_cast<index_t>(l);
+  }
+}
+
+Forest::Key Forest::key(index_t tree, int level, std::int64_t i, std::int64_t j) {
+  return {(static_cast<std::uint64_t>(tree) << 8) | static_cast<std::uint64_t>(level),
+          (static_cast<std::uint64_t>(i) << 32) | static_cast<std::uint64_t>(j)};
+}
+
+int Forest::max_level() const {
+  int m = 0;
+  for (const Leaf& l : leaves_) m = std::max(m, static_cast<int>(l.level));
+  return m;
+}
+
+index_t Forest::find_leaf(index_t tree, std::int64_t a, std::int64_t b) const {
+  constexpr std::int64_t h = std::int64_t{1} << (kMaxLevel + 1);
+  if (a < 0 || b < 0 || a >= h || b >= h) return -1;
+  for (int level = 0; level <= kMaxLevel; ++level) {
+    const int shift = kMaxLevel + 1 - level;
+    const auto it = index_.find(key(tree, level, a >> shift, b >> shift));
+    if (it != index_.end()) return it->second;
+  }
+  return -1;
+}
+
+FaceNeighbor Forest::face_neighbor(index_t l, int f) const {
+  constexpr std::int64_t h = std::int64_t{1} << (kMaxLevel + 1);
+  const Leaf& lf = leaves_[l];
+  const std::int64_t size = std::int64_t{1} << (kMaxLevel + 1 - lf.level);
+  const std::int64_t a0 = lf.i * size, b0 = lf.j * size;
+  const std::int64_t am = a0 + size / 2, bm = b0 + size / 2;
+  std::int64_t a, b;
+  switch (f) {
+    case 0: a = am; b = b0 - 1; break;
+    case 1: a = a0 + size; b = bm; break;
+    case 2: a = am; b = b0 + size; break;
+    default: a = a0 - 1; b = bm; break;
+  }
+  FaceNeighbor out;
+  index_t tree = lf.tree;
+  int nface = (f + 2) % 4;
+  if (a < 0 || b < 0 || a >= h || b >= h) {
+    // Cross the macro edge: position along it in canonical direction.
+    const MacroMesh& m = *macro_;
+    const index_t e = m.cell_edge(lf.tree, f);
+    const auto cells = m.edge_cells(e);
+    if (cells[1] < 0) return out;
+    const index_t other = cells[0] == lf.tree ? cells[1] : cells[0];
+    int of = 0;
+    while (m.cell_edge(other, of) != e) ++of;
+    const std::int64_t s_local = (f == 0) ? a : (f == 1) ? b : (f == 2) ? h - a : h - b;
+    const std::int64_t c = m.cell_edge_forward(lf.tree, f) ? s_local : h - s_local;
+    const std::int64_t s2 = m.cell_edge_forward(other, of) ? c : h - c;
+    switch (of) {
+      case 0: a = s2; b = 0; break;
+      case 1: a = h - 1; b = s2; break;
+      case 2: a = h - s2; b = h - 1; break;
+      default: a = 0; b = h - s2; break;
+    }
+    tree = other;
+    nface = of;
+  }
+  out.leaf = find_leaf(tree, a, b);
+  INSEM_CHECK(out.leaf >= 0, "forest has no leaf at a face-neighbour position");
+  out.face = nface;
+  out.level_diff = leaves_[out.leaf].level - lf.level;
+  return out;
+}
+
+double Forest::face_coordinate(index_t from, int f, double t, index_t to, int to_face) const {
+  // Tree-local coordinate u in [0, 1] along the face axis.
+  auto axis_range = [this](index_t l, int face) {
+    const Leaf& lf = leaves_[l];
+    const double n = static_cast<double>(std::int64_t{1} << lf.level);
+    const std::int64_t idx = (face == 0 || face == 2) ? lf.i : lf.j;
+    return std::array<double, 2>{idx / n, (idx + 1) / n};
+  };
+  const auto r = axis_range(from, f);
+  const double u = r[0] + 0.5 * (t + 1.0) * (r[1] - r[0]);
+  double u2 = u;
+  const Leaf& a = leaves_[from];
+  const Leaf& b = leaves_[to];
+  if (a.tree != b.tree) {
+    const MacroMesh& m = *macro_;
+    const double s = (f == 0 || f == 1) ? u : 1.0 - u;  // counter-clockwise parameter
+    const double c = m.cell_edge_forward(a.tree, f) ? s : 1.0 - s;
+    const double s2 = m.cell_edge_forward(b.tree, to_face) ? c : 1.0 - c;
+    u2 = (to_face == 0 || to_face == 1) ? s2 : 1.0 - s2;
+  }
+  const auto r2 = axis_range(to, to_face);
+  return -1.0 + 2.0 * (u2 - r2[0]) / (r2[1] - r2[0]);
+}
+
+Forest Forest::refine(const std::vector<char>& mark) const {
+  INSEM_CHECK(mark.size() == leaves_.size(), "refinement marks do not match the leaves");
+  std::vector<Leaf> out;
+  out.reserve(leaves_.size() + 3 * static_cast<std::size_t>(std::count(mark.begin(), mark.end(), 1)));
+  for (std::size_t l = 0; l < leaves_.size(); ++l) {
+    const Leaf& lf = leaves_[l];
+    if (!mark[l]) {
+      out.push_back(lf);
+      continue;
+    }
+    INSEM_CHECK(lf.level < kMaxLevel, "cannot refine beyond level " << kMaxLevel);
+    for (int c = 0; c < 4; ++c) {  // Morton order of the children
+      out.push_back({lf.tree, lf.level + 1, 2 * lf.i + (c & 1), 2 * lf.j + (c >> 1)});
+    }
+  }
+  return Forest(macro_, std::move(out));
+}
+
+Forest Forest::balance(const std::function<bool(index_t, index_t)>& must_match) const {
+  Forest current = *this;
+  for (;;) {
+    std::vector<char> mark(current.leaves_.size(), 0);
+    bool any = false;
+    for (index_t l = 0; l < current.n_leaves(); ++l) {
+      const Leaf& lf = current.leaves_[l];
+      for (int f = 0; f < 4; ++f) {
+        const FaceNeighbor nb = current.face_neighbor(l, f);
+        if (nb.leaf < 0 || nb.level_diff >= 0) continue;
+        const index_t other_tree = current.leaves_[nb.leaf].tree;
+        const bool strict = must_match && other_tree != lf.tree && must_match(lf.tree, other_tree);
+        if (nb.level_diff < -1 || strict) {
+          mark[nb.leaf] = 1;
+          any = true;
+        }
+      }
+    }
+    if (!any) return current;
+    current = current.refine(mark);
+  }
+}
 
 Forest Forest::uniform(std::shared_ptr<const MacroMesh> macro, int level) {
   INSEM_CHECK(macro, "forest needs a macro-mesh");

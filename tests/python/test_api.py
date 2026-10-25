@@ -101,3 +101,28 @@ def test_solver_state_and_reset():
     sim.set_time(n_steps=10)  # changing the description rebuilds the solver
     assert sim.solver.step == 0
     assert sim.solver.n_steps == 10
+
+
+def test_adaptive_discretization_round_trip(tmp_path):
+    m = mesh.layered((0, 4), [-2.0, 0.0, 1.0], nz=[2, 1], regions=[0, 1], nx=4)
+    disc = insem.Discretization(order=3, f_max=2.0, points_per_wavelength=6.0, max_level=4,
+                                regions=[(1.0, 2.0, -0.5, 0.5, 2)])
+    sim = insem.Simulation(m, disc)
+    sim.set_material(0, insem.Material.elastic(4.0, 2.0, 2.0))
+    sim.set_material(1, insem.Material.acoustic(1.0, 1.0))
+    sim.setup()
+    levels = sim.forest.leaves[:, 1]
+    assert levels.max() >= 2
+    # 2:1 balance across all faces.
+    for leaf in range(sim.forest.n_leaves):
+        for face in range(4):
+            nb, _, diff = sim.forest.face_neighbor(leaf, face)
+            if nb >= 0:
+                assert abs(diff) <= 1
+    path = tmp_path / "case.h5"
+    sim.save(str(path))
+    other = insem.Simulation.load(str(path))
+    assert other.discretization.f_max == 2.0
+    assert other.discretization.regions == [(1.0, 2.0, -0.5, 0.5, 2)]
+    other.setup()
+    np.testing.assert_array_equal(other.forest.leaves, sim.forest.leaves)

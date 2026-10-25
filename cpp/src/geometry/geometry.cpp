@@ -108,12 +108,14 @@ GlobalCoordinates global_coordinates(const ops::DofMap& dofs, const Geometry& ge
   out.z.resize(dofs.n_global());
   const auto& offsets = dofs.assembly_offsets();
   const auto& slots = dofs.assembly_slots();
+  const auto& l2g = dofs.local_to_global();
   double mismatch = 0.0;
   for (index_t g = 0; g < dofs.n_global(); ++g) {
-    const index_t first = slots[offsets[g]];
+    const index_t first = dofs.primary_slot(g);
     out.x[g] = geom.x[first];
     out.z[g] = geom.z[first];
-    for (index_t s = offsets[g] + 1; s < offsets[g + 1]; ++s) {
+    for (index_t s = offsets[g]; s < offsets[g + 1]; ++s) {
+      if (l2g[slots[s]] != g) continue;  // constrained contributions sit elsewhere
       mismatch = std::max({mismatch, std::abs(geom.x[slots[s]] - out.x[g]),
                            std::abs(geom.z[slots[s]] - out.z[g])});
     }

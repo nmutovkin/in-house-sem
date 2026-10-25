@@ -304,8 +304,24 @@ Macro-elements may be curved. Their mapping is inherited by every child.
   faces. It is row-sum lumped to keep explicit updates. That is a numerical
   choice and needs verification: measure spurious reflection at refinement
   interfaces, the convergence rate, and energy behaviour (§9).
+* **Measured (M2):** a plane wave crossing a coarse→fine interface in a
+  channel, with the reflection isolated by differencing against an unrefined
+  run (`tests/python/test_verification.py`). The reflection falls spectrally
+  with resolution on the coarse side:
+
+  | points per wavelength (coarse side) | order 4 | order 6 |
+  |---|---|---|
+  | ~4–6 | −39 dB (3.8), −47 dB (5.0) | −55 dB (5.7) |
+  | ~7.5 | −66 dB | −75 dB |
+  | ≥ 10 | ≤ −81 dB | ≤ −102 dB |
+
+  The −60 dB target is reached at about 7 points per wavelength on the
+  coarse side, not 5. Where that level matters, choose
+  `points_per_wavelength ≈ 7` (or order 6). The interface is not otherwise
+  harmful; energy is conserved exactly on refined meshes.
 * **Fallback** if the reflection is unacceptable: conforming 2:1 transition
-  templates for the affected faces, which need no hanging nodes. The data model supports both.
+  templates for the affected faces, which need no hanging nodes. The data
+  model supports both; this is not needed so far.
 
 ### 6.4 Quality and diagnostics
 Checks for Jacobian sign and condition, points per wavelength per leaf, the CFL

@@ -269,3 +269,54 @@ def test_scholte_wave_speed():
     frac = 0.5 * (cc[i - 1] - cc[i + 1]) / (cc[i - 1] - 2 * cc[i] + cc[i + 1])
     lag = (i + frac - (len(a) - 1)) * (s.times[1] - s.times[0])
     assert 3.0 / lag == pytest.approx(expected, rel=0.01)  # 0.16 %
+
+
+def _channel_trace(sigma, refine, order=4, h=0.5):
+    """Downgoing plane pulse in a rigid-walled acoustic channel; the lower half
+    is refined one level when `refine` is set (interface at z = -8)."""
+    m = mesh.rectangle((0, 2 * h), (-16, 0), nx=2, nz=int(round(16 / h)))
+    regions = [(-1, 3, -16, -8, 1)] if refine else []
+    sim = insem.Simulation(m, insem.Discretization(order=order, regions=regions))
+    sim.set_material(0, insem.Material.acoustic(1.0, 1.0))
+    sim.set_boundary(mesh.BOTTOM, "absorbing")
+    sim.set_boundary(mesh.TOP, "absorbing")
+    sim.add_receiver("r", 0.37 * h, -4.0, ["pressure"])
+    sim.set_time(duration=12.0, dt=0.004)
+    s = sim.solver
+    xz = s.coordinates("acoustic")
+    f = np.exp(-((xz[1] + 2.0) ** 2) / (2 * sigma**2))
+    s.set_state("acoustic", f[None], (-(xz[1] + 2.0) / sigma**2 * f)[None])
+    s.run()
+    return s.times, s.trace("r", "pressure")[:, 0]
+
+
+@pytest.mark.parametrize("sigma,max_db", [(0.3, -60.0), (0.2, -40.0)])
+def test_refinement_interface_reflection(sigma, max_db):
+    # The difference to an unrefined run isolates the reflection from the
+    # coarse-fine (hanging-node) interface. Measured: -66 dB at ~7.5 points
+    # per wavelength on the coarse side (sigma = 0.3), -47 dB at ~5 (0.2).
+    t, refined = _channel_trace(sigma, True)
+    _, uniform = _channel_trace(sigma, False)
+    incident = np.abs(uniform[t < 4.0]).max()
+    window = (t > 8.0) & (t < 11.5)
+    reflection = np.abs(refined[window] - uniform[window]).max() / incident
+    assert 20 * np.log10(reflection) < max_db
+
+
+def test_green_function_on_locally_refined_mesh():
+    # Refining a box around the source must not degrade the far-field result.
+    c, rho, xr, zr = 1.0, 1.0, 1.5, 0.7
+    m = mesh.rectangle((-4, 4), (-4, 4), nx=32, nz=32)
+    sim = insem.Simulation(m, insem.Discretization(order=4, regions=[(-0.6, 0.6, -0.6, 0.6, 2)]))
+    sim.set_material(0, insem.Material.acoustic(c, rho))
+    for tag in (mesh.BOTTOM, mesh.RIGHT, mesh.TOP, mesh.LEFT):
+        sim.set_boundary(tag, "absorbing")
+    stf = insem.ricker(1.0)
+    sim.add_source(insem.Source.monopole(0.05, -0.03, stf))
+    sim.add_receiver("r", xr, zr, ["pressure"])
+    sim.set_time(duration=4.5)
+    sim.run()
+    assert sim.dofs.n_elements > 32 * 32
+    s = sim.solver
+    expected = analytic.acoustic_pressure(s.times, stf(s.times), xr - 0.05, zr + 0.03, c, rho)
+    assert analytic.rel_l2(s.trace("r", "pressure")[:, 0], expected) < 0.03

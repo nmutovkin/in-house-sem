@@ -159,10 +159,8 @@ void Solver::build_domains(const Problem& p) {
     d.f_local.assign(d.ncomp * nl, real_t(0));
 
     d.coords.resize(2 * ng);
-    const auto& offsets = d.dofs.assembly_offsets();
-    const auto& slots = d.dofs.assembly_slots();
     for (std::size_t g = 0; g < ng; ++g) {
-      const std::size_t s = static_cast<std::size_t>(slots[offsets[g]]);
+      const std::size_t s = static_cast<std::size_t>(d.dofs.primary_slot(static_cast<index_t>(g)));
       const std::size_t q = static_cast<std::size_t>(d.leaves[s / npe]) * npe + s % npe;
       d.coords[g] = p.geometry.x[q];
       d.coords[ng + g] = p.geometry.z[q];
@@ -318,27 +316,40 @@ void Solver::build_sources(const Problem& p) {
     const index_t e = d.element_of_leaf[loc->leaf];
     const int npe = d.dofs.points_per_element();
 
-    SourceTerm term;
-    term.domain = di;
-    term.stf = src.stf;
-    term.coef.assign(static_cast<std::size_t>(d.ncomp) * npe, real_t(0));
-    for (int k = 0; k < npe; ++k) term.points.push_back(d.dofs.global_index(e, k));
+    // Force on each local point, then distributed to global points through
+    // the slot's constraint row (C^T), accumulated in global order.
+    std::map<index_t, std::array<double, 2>> acc;
     const auto& c = src.components;
     for (int k = 0; k < npe; ++k) {
+      double fx = 0.0, fz = 0.0;
       switch (src.kind) {
         case Source::Kind::Force:
-          term.coef[k] = static_cast<real_t>(c[0] * w.value[k]);
-          term.coef[npe + k] = static_cast<real_t>(c[1] * w.value[k]);
+          fx = c[0] * w.value[k];
+          fz = c[1] * w.value[k];
           break;
         case Source::Kind::MomentTensor:
           // Equivalent body force -div(M delta): f_a(p) = M_ab d_b phi_p(x_s).
-          term.coef[k] = static_cast<real_t>(c[0] * w.d_dx[k] + c[2] * w.d_dz[k]);
-          term.coef[npe + k] = static_cast<real_t>(c[2] * w.d_dx[k] + c[1] * w.d_dz[k]);
+          fx = c[0] * w.d_dx[k] + c[2] * w.d_dz[k];
+          fz = c[2] * w.d_dx[k] + c[1] * w.d_dz[k];
           break;
         case Source::Kind::Monopole:
-          term.coef[k] = static_cast<real_t>(w.value[k]);
+          fx = w.value[k];
           break;
       }
+      for (const auto& [g, wt] : d.dofs.slot_entries(e, k)) {
+        acc[g][0] += wt * fx;
+        acc[g][1] += wt * fz;
+      }
+    }
+    SourceTerm term;
+    term.domain = di;
+    term.stf = src.stf;
+    for (const auto& [g, f] : acc) term.points.push_back(g);
+    term.coef.resize(static_cast<std::size_t>(d.ncomp) * acc.size());
+    std::size_t i = 0;
+    for (const auto& [g, f] : acc) {
+      for (int comp = 0; comp < d.ncomp; ++comp) term.coef[comp * acc.size() + i] = static_cast<real_t>(f[comp]);
+      ++i;
     }
     sources_.push_back(std::move(term));
   }
@@ -361,11 +372,20 @@ void Solver::build_receivers(const Problem& p) {
     const Domain& d = domains_[term.domain];
     const PointWeights w = point_weights(p.forest, lagrange_, *loc);
     const index_t e = d.element_of_leaf[loc->leaf];
+    // Interpolation weights on global points (constrained slots expanded).
+    std::map<index_t, std::array<double, 3>> acc;
     for (int k = 0; k < d.dofs.points_per_element(); ++k) {
-      term.points.push_back(d.dofs.global_index(e, k));
-      term.value.push_back(static_cast<real_t>(w.value[k]));
-      term.d_dx.push_back(static_cast<real_t>(w.d_dx[k]));
-      term.d_dz.push_back(static_cast<real_t>(w.d_dz[k]));
+      for (const auto& [g, wt] : d.dofs.slot_entries(e, k)) {
+        acc[g][0] += wt * w.value[k];
+        acc[g][1] += wt * w.d_dx[k];
+        acc[g][2] += wt * w.d_dz[k];
+      }
+    }
+    for (const auto& [g, c] : acc) {
+      term.points.push_back(g);
+      term.value.push_back(static_cast<real_t>(c[0]));
+      term.d_dx.push_back(static_cast<real_t>(c[1]));
+      term.d_dz.push_back(static_cast<real_t>(c[2]));
     }
     term.rho = material_of_leaf(p, loc->leaf).rho;
     INSEM_CHECK(!rec.quantities.empty(), "receiver '" << rec.name << "' records no quantities");

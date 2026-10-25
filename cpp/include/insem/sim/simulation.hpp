@@ -19,10 +19,27 @@ namespace solver {
 class Solver;
 }
 
-// Parameters that turn the macro-mesh into computational elements.
+// Refine leaves that intersect a box to at least `level`.
+struct RefinementRegion {
+  double xmin, xmax, zmin, zmax;
+  int level;
+};
+
+// Parameters that turn the macro-mesh into computational elements
+// (docs/DESIGN.md §6.2): uniform refinement, then adaptive refinement until
+// every leaf satisfies h <= order * lambda_min / points_per_wavelength
+// (lambda_min = slowest wave speed / f_max; skipped when f_max = 0) and the
+// refinement regions, then 2:1 balance with equal levels across
+// fluid-solid faces.
 struct Discretization {
   int order = 4;          // polynomial degree N (N + 1 GLL points per direction)
   int uniform_level = 0;  // uniform quadtree refinement of every macro-cell
+  double f_max = 0.0;     // highest frequency to resolve (Hz); 0 = no wavelength criterion
+  double points_per_wavelength = 5.0;
+  int max_level = 12;     // adaptive refinement stops at this level
+  std::vector<RefinementRegion> regions;
+
+  bool adaptive() const { return f_max > 0.0 || !regions.empty(); }
 };
 
 // The single object model of a run (docs/DESIGN.md §7.1). It holds the
@@ -83,6 +100,8 @@ class Simulation {
  private:
   void require_setup() const;
   void invalidate_solver();
+  void invalidate_setup();
+  mesh::Forest build_forest() const;
 
   std::shared_ptr<const mesh::MacroMesh> mesh_;
   Discretization disc_;

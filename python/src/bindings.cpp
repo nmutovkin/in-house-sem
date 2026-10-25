@@ -185,7 +185,20 @@ PYBIND11_MODULE(_core, m) {
         for (const auto& l : f.leaves()) v.insert(v.end(), {l.tree, l.level, l.i, l.j});
         return to_numpy(v, {f.n_leaves(), 4});
       }, "(n_leaves, 4) array of (tree, level, i, j).")
-      .def("leaf_box", &mesh::Forest::leaf_box, py::arg("leaf"));
+      .def("leaf_box", &mesh::Forest::leaf_box, py::arg("leaf"))
+      .def_property_readonly("max_level", &mesh::Forest::max_level)
+      .def("face_neighbor", [](const mesh::Forest& f, index_t l, int face) {
+        const auto nb = f.face_neighbor(l, face);
+        return py::make_tuple(nb.leaf, nb.face, nb.level_diff);
+      }, py::arg("leaf"), py::arg("face"), "(neighbour leaf or -1, its face, level difference).")
+      .def("leaf_corners", [](const mesh::Forest& f, index_t l) {
+        std::vector<double> out;
+        for (auto [xi, eta] : {std::pair{-1.0, -1.0}, {1.0, -1.0}, {1.0, 1.0}, {-1.0, 1.0}}) {
+          const auto p = geometry::leaf_map(f, l, xi, eta);
+          out.insert(out.end(), p.begin(), p.end());
+        }
+        return to_numpy(out, {4, 2});
+      }, py::arg("leaf"), "(4, 2) physical corner coordinates of a leaf.");
 
   // ---- ops
   py::class_<ops::DofMap>(m, "DofMap")
@@ -359,10 +372,33 @@ PYBIND11_MODULE(_core, m) {
 
   // ---- simulation
   py::class_<Discretization>(m, "Discretization")
-      .def(py::init([](int order, int uniform_level) { return Discretization{order, uniform_level}; }),
-           py::arg("order") = 4, py::arg("uniform_level") = 0)
-      .def_readwrite("order", &Discretization::order)
-      .def_readwrite("uniform_level", &Discretization::uniform_level);
+      .def(py::init([](int order, int uniform_level, double f_max, double ppw, int max_level,
+                       const std::vector<std::tuple<double, double, double, double, int>>& regions) {
+             Discretization d;
+             d.order = order;
+             d.uniform_level = uniform_level;
+             d.f_max = f_max;
+             d.points_per_wavelength = ppw;
+             d.max_level = max_level;
+             for (const auto& [x0, x1, z0, z1, level] : regions) d.regions.push_back({x0, x1, z0, z1, level});
+             return d;
+           }),
+           py::arg("order") = 4, py::arg("uniform_level") = 0, py::arg("f_max") = 0.0,
+           py::arg("points_per_wavelength") = 5.0, py::arg("max_level") = 12,
+           py::arg("regions") = std::vector<std::tuple<double, double, double, double, int>>{},
+           "Element order and refinement: uniform levels, then adaptive refinement to points_per_wavelength "
+           "at f_max (0 = off) and to the levels of regions [(xmin, xmax, zmin, zmax, level), ...], "
+           "capped at max_level; then 2:1 balance.")
+      .def_readonly("order", &Discretization::order)
+      .def_readonly("uniform_level", &Discretization::uniform_level)
+      .def_readonly("f_max", &Discretization::f_max)
+      .def_readonly("points_per_wavelength", &Discretization::points_per_wavelength)
+      .def_readonly("max_level", &Discretization::max_level)
+      .def_property_readonly("regions", [](const Discretization& d) {
+        std::vector<std::tuple<double, double, double, double, int>> out;
+        for (const auto& r : d.regions) out.emplace_back(r.xmin, r.xmax, r.zmin, r.zmax, r.level);
+        return out;
+      });
 
   py::class_<Simulation>(m, "Simulation")
       .def(py::init([](std::shared_ptr<mesh::MacroMesh> mesh, const Discretization& disc) {

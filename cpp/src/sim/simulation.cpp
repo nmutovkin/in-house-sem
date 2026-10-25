@@ -1,5 +1,8 @@
 #include "insem/sim/simulation.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -40,6 +43,13 @@ Simulation::Simulation(std::shared_ptr<const mesh::MacroMesh> mesh, Discretizati
               "polynomial order " << disc_.order << " not in [1, 16]");
   INSEM_CHECK(disc_.uniform_level >= 0 && disc_.uniform_level <= mesh::Forest::kMaxLevel,
               "uniform refinement level " << disc_.uniform_level << " out of range");
+  INSEM_CHECK(disc_.max_level >= disc_.uniform_level && disc_.max_level <= mesh::Forest::kMaxLevel,
+              "max_level " << disc_.max_level << " must be in [uniform_level, " << mesh::Forest::kMaxLevel << "]");
+  INSEM_CHECK(disc_.f_max >= 0.0 && disc_.points_per_wavelength > 0.0, "invalid wavelength refinement parameters");
+  for (const auto& r : disc_.regions) {
+    INSEM_CHECK(r.xmin <= r.xmax && r.zmin <= r.zmax && r.level >= 0 && r.level <= mesh::Forest::kMaxLevel,
+                "invalid refinement region");
+  }
 }
 
 Simulation::~Simulation() = default;
@@ -48,10 +58,22 @@ Simulation& Simulation::operator=(Simulation&&) noexcept = default;
 
 void Simulation::invalidate_solver() { solver_.reset(); }
 
+void Simulation::invalidate_setup() {
+  invalidate_solver();
+  forest_.reset();
+  dofs_.reset();
+  geometry_.reset();
+}
+
 void Simulation::set_material(int region, const Material& material) {
   material.validate();
   materials_[region] = material;
-  invalidate_solver();
+  // Materials drive adaptive refinement and the fluid-solid balance.
+  if (disc_.adaptive()) {
+    invalidate_setup();
+  } else {
+    invalidate_solver();
+  }
 }
 
 void Simulation::set_boundary(int tag, BoundaryType type) {
@@ -92,11 +114,67 @@ void Simulation::set_time(const TimeConfig& time) {
   invalidate_solver();
 }
 
+mesh::Forest Simulation::build_forest() const {
+  mesh::Forest forest = mesh::Forest::uniform(mesh_, disc_.uniform_level);
+  if (disc_.f_max > 0.0) {
+    for (int region : std::set<int>(mesh_->materials().begin(), mesh_->materials().end())) {
+      INSEM_CHECK(materials_.count(region), "wavelength-based refinement needs a material for region " << region);
+    }
+  }
+  for (;;) {
+    std::vector<char> mark(forest.n_leaves(), 0);
+    bool any = false;
+    for (index_t l = 0; l < forest.n_leaves(); ++l) {
+      const mesh::Leaf& lf = forest.leaf(l);
+      if (lf.level >= disc_.max_level) continue;
+      std::array<std::array<double, 2>, 4> c;
+      const double ref[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+      for (int k = 0; k < 4; ++k) c[k] = geometry::leaf_map(forest, l, ref[k][0], ref[k][1]);
+      bool refine = false;
+      if (disc_.f_max > 0.0) {
+        double h = 0.0;
+        for (int k = 0; k < 4; ++k) {
+          h = std::max(h, std::hypot(c[(k + 1) % 4][0] - c[k][0], c[(k + 1) % 4][1] - c[k][1]));
+        }
+        const Material& m = materials_.at(mesh_->material(lf.tree));
+        const double v_min = m.medium == Medium::Elastic ? m.vs : m.vp;
+        refine = h > disc_.order * (v_min / disc_.f_max) / disc_.points_per_wavelength;
+      }
+      if (!refine) {
+        double x0 = c[0][0], x1 = c[0][0], z0 = c[0][1], z1 = c[0][1];
+        for (const auto& p : c) {
+          x0 = std::min(x0, p[0]);
+          x1 = std::max(x1, p[0]);
+          z0 = std::min(z0, p[1]);
+          z1 = std::max(z1, p[1]);
+        }
+        for (const auto& r : disc_.regions) {
+          if (lf.level < r.level && x0 <= r.xmax && x1 >= r.xmin && z0 <= r.zmax && z1 >= r.zmin) refine = true;
+        }
+      }
+      if (refine) {
+        mark[l] = 1;
+        any = true;
+      }
+    }
+    if (!any) break;
+    forest = forest.refine(mark);
+  }
+  // Fluid and solid leaves must meet at equal levels (conforming interface).
+  const auto& materials = materials_;
+  const auto mesh = mesh_;
+  return forest.balance([&materials, mesh](index_t a, index_t b) {
+    const auto ma = materials.find(mesh->material(a));
+    const auto mb = materials.find(mesh->material(b));
+    return ma != materials.end() && mb != materials.end() && ma->second.medium != mb->second.medium;
+  });
+}
+
 void Simulation::setup() {
   if (is_setup()) return;
   const int ngll = disc_.order + 1;
   gll_ = basis::gll(ngll);
-  forest_ = mesh::Forest::uniform(mesh_, disc_.uniform_level);
+  forest_ = build_forest();
   dofs_ = ops::DofMap::build(*forest_, ngll);
   geometry_ = geometry::compute_geometry(*forest_, gll_->points, gll_->points);
 }
@@ -172,6 +250,12 @@ void Simulation::save(const std::string& path) const {
   f.create_group("/discretization");
   f.set_attribute("/discretization", "order", static_cast<std::int64_t>(disc_.order));
   f.set_attribute("/discretization", "uniform_level", static_cast<std::int64_t>(disc_.uniform_level));
+  f.set_attribute("/discretization", "f_max", disc_.f_max);
+  f.set_attribute("/discretization", "points_per_wavelength", disc_.points_per_wavelength);
+  f.set_attribute("/discretization", "max_level", static_cast<std::int64_t>(disc_.max_level));
+  std::vector<double> regions;
+  for (const auto& r : disc_.regions) regions.insert(regions.end(), {r.xmin, r.xmax, r.zmin, r.zmax, double(r.level)});
+  f.write("/discretization/regions", regions.data(), {disc_.regions.size(), 5});
 
   f.create_group("/materials");
   for (const auto& [region, mat] : materials_) {
@@ -253,6 +337,15 @@ Simulation Simulation::load(const std::string& path) {
   Discretization disc;
   disc.order = static_cast<int>(f.attribute_int("/discretization", "order"));
   disc.uniform_level = static_cast<int>(f.attribute_int("/discretization", "uniform_level"));
+  if (f.has_attribute("/discretization", "f_max")) {
+    disc.f_max = f.attribute_double("/discretization", "f_max");
+    disc.points_per_wavelength = f.attribute_double("/discretization", "points_per_wavelength");
+    disc.max_level = static_cast<int>(f.attribute_int("/discretization", "max_level"));
+    const auto r = f.read<double>("/discretization/regions");
+    for (std::size_t i = 0; i + 4 < r.size(); i += 5) {
+      disc.regions.push_back({r[i], r[i + 1], r[i + 2], r[i + 3], static_cast<int>(r[i + 4])});
+    }
+  }
   Simulation sim(std::move(m), disc);
 
   // Problem description groups are optional (a mesh-only case is valid).
