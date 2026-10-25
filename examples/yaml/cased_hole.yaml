@@ -1,0 +1,26 @@
+# Monopole sonic log in a cased hole crossing a sand bed between shales.
+# Run with:  insem run examples/yaml/cased_hole.yaml
+mesh:
+  borehole:
+    z: [-1.0, 4.0]
+    annuli: [[mud, 0.101], [casing, 0.110], [cement, 0.150]]
+    formation_radius: 2.5
+    beds: [[-1.0, shale], [1.2, sand], [2.2, shale]]
+    dz: 0.08
+    dr: 0.3
+discretization: {order: 4, f_max: 12500}
+materials:
+  mud:    {medium: acoustic, vp: 1500, rho: 1000}
+  casing: {medium: elastic, vp: 5900, vs: 3200, rho: 7850}
+  cement: {medium: elastic, vp: 3000, vs: 1700, rho: 1900}
+  shale:  {medium: elastic, vp: 3200, vs: 1600, rho: 2400}
+  sand:   {medium: elastic, vp: 4200, vs: 2500, rho: 2300}
+boundaries: {bottom: absorbing, outer: absorbing, top: absorbing}
+sources:
+  - {type: monopole, position: [0, 0], stf: {type: ricker, f0: 5000}}
+receivers:
+  - {line: {start: [0, 1.0], end: [0, 3.1], n: 8}, prefix: rx, quantities: [pressure]}
+time: {duration: 0.0025, record_every: 4}
+output:
+  directory: cased_hole_out
+  segy: [{quantity: pressure, file: array.sgy}]

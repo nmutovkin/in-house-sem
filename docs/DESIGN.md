@@ -131,6 +131,19 @@ head waves, Stoneley, pseudo-Rayleigh) at 2D cost.
 * Axisymmetry is a **geometry kind**, not a separate solver (§7.3). Axial and
   off-axis axisymmetric elements are separate element-block types with their own
   quadrature and hoop terms.
+* **Implemented (M3).** Cells with a face on the axis are renumbered so that it is
+  face 3 (ξ = −1); their leaves use GLJ(0,1) points along ξ. The weak form is
+  per radian: every integral carries r, and source strengths are divided by 2π
+  (a 3D point source on the axis; a ring source off it). In axial elements,
+  ∫f r dξ = ∫f [r/(1+ξ)] (1+ξ) dξ is integrated with the GLJ rule, so the axis
+  mass stays positive; r/(1+ξ) → ∂r/∂ξ on the axis. The hoop strain u_r/r →
+  ∂u_r/∂r on the axis is used on both the trial and the test side, which keeps
+  the operator symmetric (energy is conserved exactly). u_r = 0 is imposed on
+  the axis, and axis faces take no boundary condition.
+* **Finding:** first-order Stacey boundaries reflect the guided Stoneley wave
+  at the top and bottom of a borehole model by a few percent. Models must be
+  tall enough that these reflections arrive after the recording window, until
+  C-PML (M6) is in place.
 
 **Limitation:** pure axisymmetry (m = 0) only allows on-axis sources with
 axisymmetric radiation. That covers the monopole sonic source, an explosion
@@ -511,7 +524,7 @@ problems fit on one node or GPU; it becomes essential for 3D.
 | **M0** Foundations ✅ | CMake + scikit-build, CI (CPU), GLL/GLJ basis, macro-mesh + forest data model (uniform refinement), leaf geometry and geometry kinds, dof map + deterministic gather/scatter, HDF5 I/O, Python bindings | unit tests |
 | **M1** 2D Cartesian core (CPU) ✅ | elastic + acoustic (pressure) element blocks, leapfrog, Stacey, free/rigid boundaries, forcings, point receivers, energy monitor, layered template, OpenMP | analytic 2D Green's functions, Rayleigh speed, convergence, energy |
 | **M2** Coupling + refinement ✅ | fluid–solid coupling, adaptive quadtree + 2:1 balance + hanging nodes, Gmsh import, SEG-Y/XDMF, YAML | normal-incidence R/T, Scholte speed, refinement-interface reflection, Lamb's problem (wavenumber integration) |
-| **M3** Axisymmetric monopole | axisym blocks (GLJ axis), borehole template (open/cased hole, beds), monopole source, DWM reference solver, STC post-processing | 3D analytic on axis, DWM open and cased hole |
+| **M3** Axisymmetric monopole ✅ | axisym blocks (GLJ axis), borehole template (open/cased hole, beds), monopole source, DWM reference solver, STC post-processing | 3D analytic on axis (0.05–0.7 %), DWM open (0.2–0.9 %) and cased hole (0.2–0.6 %), STC picks identical to the reference |
 | **M4** Dipole (2.5D, m = 1) | azimuthal-mode blocks, mode-dependent axis conditions, dipole source and receivers, flexural dispersion tools | DWM dipole, flexural dispersion |
 | **M5** CUDA backend | all blocks + gather/scatter + observers on GPU, strict-FP mode, batched multi-simulation runs | bitwise CPU/CUDA equivalence, performance |
 | **M6** C-PML | PML blocks (all geometry kinds, including axisym and modes), LDDRK | reflection vs Stacey, guided-wave absorption |

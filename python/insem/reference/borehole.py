@@ -153,10 +153,9 @@ def _reflection(layers: Sequence[Layer], formation: Material, w, k):
         else:
             eqs = [(q, q, 1.0) for q in ("ur", "uz", "srr", "srz")]
         for q_in, q_out, sign in eqs:
-            # inner quantity - sign * outer quantity = 0 (for s_rz: the solid side only)
-            if q_out is None:
-                solid, o = (outer, o_out) if inner.fluid else (inner, o_in)
-                coeffs = (outer.rows(r) if inner.fluid else inner.rows(r))["srz"]
+            # inner quantity - sign * outer quantity = 0
+            if q_out is None:  # s_rz = 0 on the solid side of a fluid-solid face
+                coeffs, o = (ro["srz"], o_out) if inner.fluid else (ri["srz"], o_in)
                 for j, c in enumerate(coeffs):
                     M[:, row, o + j] = c
                 row += 1

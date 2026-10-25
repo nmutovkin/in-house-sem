@@ -9,33 +9,35 @@ The architecture, roadmap and open questions are in
 
 ## Status
 
-Milestones **M0**, **M1** and **M2** are done: a verified 2D Cartesian
-acoustic–elastic solver on CPU with fluid–solid coupling and adaptive meshes.
+Milestones **M0–M3** are done: a verified 2D acoustic–elastic solver on CPU
+with fluid–solid coupling and adaptive meshes, in Cartesian (x, z) and
+**axisymmetric (r, z)** form, with a borehole template, a discrete-wavenumber
+reference and STC for **monopole sonic logging** in open and cased holes.
 
 | Area | What exists |
 |---|---|
-| Physics | 2D isotropic elastic (P–SV) and acoustic (pressure formulation), **fluid–solid coupling** |
-| Meshes | macro-mesh (Quad4/Quad9) from templates (`rectangle`, `layered` with curved interfaces) or **Gmsh** (`.msh` 2.2/4.1); **adaptive quadtree refinement** (points per wavelength at f_max, refinement boxes) with 2:1 balance and hanging-node constraints |
-| Discretisation | GLL spectral elements of order 1–8; element blocks by geometry kind (`rect`, `affine`, `curved`); deterministic assembly |
+| Physics | isotropic elastic and acoustic (pressure formulation), fluid–solid coupling; Cartesian 2D (P–SV) and **axisymmetric** (true 3D fields for axisymmetric models: monopole sonic logging) |
+| Meshes | templates (`rectangle`, `layered` with curved interfaces, **`borehole`** with annuli, beds and radial grading) or Gmsh (`.msh` 2.2/4.1); adaptive quadtree refinement (points per wavelength at f_max, boxes) with 2:1 balance and hanging nodes |
+| Discretisation | GLL spectral elements of order 1–8; GLJ points along r in elements on the axis; element blocks by geometry kind; deterministic assembly |
 | Time stepping | explicit central differences; stable Δt from power iteration (coupled operator included); discrete energy monitor |
-| Boundaries | free / rigid / Stacey absorbing per boundary tag |
-| Sources | point force, moment tensor, acoustic monopole at arbitrary positions; Ricker, Gaussian, Gaussian derivative or sampled time functions |
-| Receivers | displacement, velocity, acceleration (elastic); pressure, particle velocity (acoustic); side selectable on interfaces |
-| Output | case and results files (HDF5), wavefield snapshots, **ParaView (XDMF)** and **SEG-Y rev 2** export |
-| Interfaces | Python API, **YAML configs** and the `insem` command (`run`, `build`, `info`), C++ `insem-run` for case files |
+| Boundaries | free / rigid / Stacey absorbing per boundary tag; symmetry axis |
+| Sources | point force, moment tensor, acoustic monopole (3D point sources on the axis, ring sources off it); Ricker, Gaussian, Gaussian derivative or sampled time functions |
+| Receivers | displacement, velocity, acceleration (elastic); pressure, particle velocity (acoustic) |
+| Output | case and results files (HDF5), snapshots, ParaView (XDMF) and SEG-Y rev 2 export, **slowness–time coherence** |
+| References | `insem.reference.borehole_axis_pressure`: discrete-wavenumber solution for a monopole in a fluid-filled borehole with any fluid/solid annuli |
+| Interfaces | Python API, YAML configs and the `insem` command, C++ `insem-run` |
 
-Verification (`tests/python/test_verification.py`), all against independent
-references:
+Verification (all against independent references; see `tests/python`):
 
 | Check | Error |
 |---|---|
-| 2D acoustic and elastic Green's functions (force, explosion, double couple), straight and curved meshes | 0.1–1.3 % |
-| Lamb's problem (surface line load), wavenumber-integration reference | 1.6 % (order 4), 0.3 % (order 6) |
-| Fluid–solid reflection / transmission at normal incidence | 4 digits |
-| Scholte wave speed | 0.16 % |
-| Rayleigh wave speed | 0.2 % |
-| Spectral convergence (eigenmode), energy conservation (also on refined meshes) | exponential / round-off |
-| Refinement-interface reflection | −66 dB at ~7.5, −47 dB at ~5 points per wavelength |
+| 2D Green's functions (force, explosion, double couple), straight and curved meshes | 0.1–1.3 % |
+| Lamb's problem (wavenumber integration) | 1.6 % (order 4), 0.3 % (order 6) |
+| Fluid–solid R/T at normal incidence; Scholte speed; Rayleigh speed | 4 digits; 0.16 %; 0.2 % |
+| **Axisymmetric vs 3D analytic**: fluid point source; elastic vertical force, explosion | 0.05–0.7 %; 0.1–0.6 % |
+| **Borehole monopole vs discrete-wavenumber reference**: open hole; cased hole (steel + cement) | 0.2–0.9 %; 0.2–0.6 % |
+| STC picks of SEM vs reference arrays (P, S, Stoneley) | identical |
+| Energy conservation (also refined, axisymmetric); refinement-interface reflection | round-off; −66 dB at ~7.5 points/wavelength |
 
 ## Building
 
@@ -101,6 +103,8 @@ More examples:
 
 | Example | What it shows |
 |---|---|
+| `examples/borehole/run.py` | monopole sonic log in open and cased holes: mesh, snapshots, array waveforms vs the discrete-wavenumber reference, STC |
+| `examples/yaml/cased_hole.yaml` | cased hole crossing a sand bed, as a YAML configuration |
 | `examples/layered_2d/run.py` | two-layer elastic model with a curved interface, double-couple source, receiver line |
 | `examples/gmsh_seabed/run.py` | Gmsh mesh (curved seabed, buried lens), wavelength-based refinement, fluid–solid coupling, snapshot and gather plots; `make_mesh.py` regenerates the mesh with Gmsh |
 | `examples/verification/plot_verification.py` | SEM against Lamb's problem and the analytic double-couple solution |

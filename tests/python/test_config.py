@@ -116,3 +116,16 @@ def test_formulas_evaluate():
     f = config._formula("-150 + 30*sin(2*pi*x/800) + sqrt(abs(x))")
     x = np.array([0.0, 200.0])
     np.testing.assert_allclose(f(x), -150 + 30 * np.sin(2 * np.pi * x / 800) + np.sqrt(x))
+
+
+def test_borehole_config():
+    cfg = yaml.safe_load((Path(__file__).parents[2] / "examples" / "yaml" / "cased_hole.yaml").read_text())
+    built = config.build(cfg)
+    sim = built.simulation
+    assert sim.mesh.coords == "axisymmetric"
+    assert built.names["regions"] == {"mud": 1, "casing": 2, "cement": 3, "shale": 4, "sand": 5}
+    assert sim.boundaries == {1: "absorbing", 2: "absorbing", 3: "absorbing"}
+    assert sim.materials[2].vs == 3200.0
+    assert len(sim.receivers) == 8 and sim.receivers[0].position[0] == 0.0
+    with pytest.raises(config.ConfigError, match="axisymmetric"):
+        config.build(dict(cfg, mesh=dict(cfg["mesh"], coords="cartesian")))

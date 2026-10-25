@@ -21,10 +21,13 @@ Example::
     output: {segy: [{quantity: velocity, component: z}], xdmf: false}
 
 Mesh: exactly one of ``rectangle`` (arguments of ``mesh.rectangle``),
-``layered`` (``mesh.layered``; an interface may be a formula in x) or
-``gmsh`` (``{file: ..., plane: xy}``), plus optional ``coords``.
+``layered`` (``mesh.layered``; an interface may be a formula in x),
+``gmsh`` (``{file: ..., plane: xy}``) or ``borehole`` (``mesh.borehole``,
+axisymmetric; ``annuli: [[mud, 0.1], [casing, 0.11]]``,
+``beds: [[z_bottom, name], ...]``), plus optional ``coords``.
 Materials and boundaries are keyed by region / tag ids or by names: the
-template boundary names bottom/right/top/left, or Gmsh physical names.
+template boundary names bottom/right/top/left, borehole region and
+boundary names (bottom/outer/top), or Gmsh physical names.
 """
 
 from __future__ import annotations
@@ -95,10 +98,10 @@ class Built:
 
 
 def _build_mesh(cfg, base: Path):
-    _check_keys("mesh", cfg, {"rectangle", "layered", "gmsh", "coords"})
-    kinds = [k for k in ("rectangle", "layered", "gmsh") if k in cfg]
+    _check_keys("mesh", cfg, {"rectangle", "layered", "gmsh", "borehole", "coords"})
+    kinds = [k for k in ("rectangle", "layered", "gmsh", "borehole") if k in cfg]
     if len(kinds) != 1:
-        raise ConfigError("mesh: give exactly one of 'rectangle', 'layered' or 'gmsh'")
+        raise ConfigError("mesh: give exactly one of 'rectangle', 'layered', 'gmsh' or 'borehole'")
     coords = cfg.get("coords", "cartesian")
     kind = kinds[0]
     args = dict(cfg[kind])
@@ -111,6 +114,16 @@ def _build_mesh(cfg, base: Path):
                     ["x", "interfaces", "nz", "regions"])
         args["interfaces"] = [_formula(i) if isinstance(i, str) else float(i) for i in args["interfaces"]]
         m = _mesh.layered(coords=coords, **args)
+    elif kind == "borehole":
+        _check_keys("mesh.borehole", args, {"z", "annuli", "formation_radius", "beds", "dz", "dr", "growth",
+                                            "fluid_cells", "quadratic"}, ["z", "annuli", "formation_radius"])
+        if "coords" in cfg and coords != "axisymmetric":
+            raise ConfigError("mesh.borehole is always axisymmetric")
+        args["annuli"] = [(str(name), float(r)) for name, r in args["annuli"]]
+        args["beds"] = [(float(z), str(name)) for z, name in args.get("beds", [])]
+        b = _mesh.borehole(**args)
+        m = b.mesh
+        names = {"regions": b.regions, "boundaries": b.boundaries}
     else:
         _check_keys("mesh.gmsh", args, {"file", "plane"}, ["file"])
         g = _mesh.read_gmsh(base / args["file"], plane=args.get("plane", "xy"), coords=coords)
