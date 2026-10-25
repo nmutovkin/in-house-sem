@@ -1,0 +1,27 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "insem"
+version = "0.1.0"
+description = "Spectral element simulator for coupled acoustic-elastic wave propagation (sonic logging)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "h5py>=3.8"]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "scipy>=1.10"]
+
+[tool.scikit-build]
+wheel.packages = ["python/insem"]
+cmake.build-type = "Release"
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+INSEM_BUILD_PYTHON = "ON"
+INSEM_BUILD_TESTS = "OFF"
+INSEM_BUILD_APPS = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]

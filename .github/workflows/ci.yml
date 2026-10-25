@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpp:
+    name: C++ (${{ matrix.real }}${{ matrix.strict == 'ON' && ', strict FP' || '' }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - real: float
+            strict: "OFF"
+          - real: double
+            strict: "ON"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev catch2
+      - name: Configure
+        run: cmake -S . -B build -DINSEM_REAL=${{ matrix.real }} -DINSEM_STRICT_FP=${{ matrix.strict }}
+      - name: Build
+        run: cmake --build build -j4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  python:
+    name: Python
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
+      - name: Build and install
+        run: pip install ".[test]"
+      - name: Test
+        run: pytest -q
