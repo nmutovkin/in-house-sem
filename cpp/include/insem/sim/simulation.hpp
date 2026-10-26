@@ -31,6 +31,10 @@ struct RefinementRegion {
 // (lambda_min = slowest wave speed / f_max; skipped when f_max = 0) and the
 // refinement regions, then 2:1 balance with equal levels across
 // fluid-solid faces.
+//
+// azimuthal_order (axisymmetric meshes only, docs/DESIGN.md §2.5) selects the
+// Fourier order m of the fields in theta: 0 for axisymmetric fields
+// (monopole), 1 for fields varying as cos(theta) / sin(theta) (dipole).
 struct Discretization {
   int order = 4;          // polynomial degree N (N + 1 GLL points per direction)
   int uniform_level = 0;  // uniform quadtree refinement of every macro-cell
@@ -38,6 +42,7 @@ struct Discretization {
   double points_per_wavelength = 5.0;
   int max_level = 12;     // adaptive refinement stops at this level
   std::vector<RefinementRegion> regions;
+  int azimuthal_order = 0;
 
   bool adaptive() const { return f_max > 0.0 || !regions.empty(); }
 };

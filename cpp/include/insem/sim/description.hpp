@@ -72,8 +72,17 @@ struct SourceTimeFunction {
 //   MomentTensor: components = (mxx, mzz, mxz) in N m
 //   Monopole:     acoustic volume-injection source; the time function is
 //                 d^2 Q / dt^2, with Q the injected volume (components unused)
+//   Dipole:       acoustic point force (a dipole of the pressure field),
+//                 components = (fx, fz, -) in N; the time function is the force
+//
+// Axisymmetric models (docs/DESIGN.md §2.4, §2.5): sources on the axis are 3D
+// point sources, off the axis rings. In azimuthal order 0 they must be
+// axisymmetric (no horizontal force or dipole on the axis); in azimuthal
+// order 1 they are the cos(theta) parts: a horizontal (x) force or dipole on
+// the axis, or off the axis a ring whose density varies as cos(theta) and
+// whose net force is (fx, 0, 0) (fz: a vertical cos(theta) ring).
 struct Source {
-  enum class Kind : int { Force = 0, MomentTensor = 1, Monopole = 2 };
+  enum class Kind : int { Force = 0, MomentTensor = 1, Monopole = 2, Dipole = 3 };
 
   Kind kind = Kind::Force;
   std::array<double, 2> position{0.0, 0.0};
@@ -84,17 +93,25 @@ struct Source {
   static Source moment_tensor(double x, double z, double mxx, double mzz, double mxz,
                               SourceTimeFunction stf);
   static Source monopole(double x, double z, SourceTimeFunction stf);
+  static Source dipole(double x, double z, double fx, double fz, SourceTimeFunction stf);
 
   // The medium the source must lie in.
-  Medium medium() const { return kind == Kind::Monopole ? Medium::Acoustic : Medium::Elastic; }
+  Medium medium() const {
+    return kind == Kind::Monopole || kind == Kind::Dipole ? Medium::Acoustic : Medium::Elastic;
+  }
   std::string kind_name() const;
 };
 
 // ---------------------------------------------------------------- receivers
 
 // Recorded quantities:
-//   elastic:  "displacement", "velocity", "acceleration"   (2 components: x, z)
-//   acoustic: "pressure" (1 component), "particle_velocity" (2 components)
+//   elastic:  "displacement", "velocity", "acceleration"   (2 components: x, z;
+//             azimuthal order 1: 3 components r, theta, z, see below)
+//   acoustic: "pressure" (1 component), "particle_velocity" (2 components: x, z)
+// In azimuthal order 1 the recorded values are the mode amplitudes: the
+// field at azimuth theta is (u_r, u_theta, u_z) = (U_r cos, U_theta sin,
+// U_z cos)(theta), and p = P cos(theta), so traces are the theta = 0 values
+// (U_theta: the theta = 90 degree value).
 // `medium` ("acoustic", "elastic" or empty for either) selects the side of a
 // receiver placed on a fluid-solid interface.
 struct Receiver {
@@ -106,7 +123,7 @@ struct Receiver {
 
 // Number of components of a recorded quantity; throws for unknown names or
 // quantities that do not exist in `medium`.
-int quantity_components(const std::string& quantity, Medium medium);
+int quantity_components(const std::string& quantity, Medium medium, int azimuthal_order = 0);
 
 // ---------------------------------------------------------------- time
 

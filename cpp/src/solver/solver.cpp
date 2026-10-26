@@ -59,6 +59,26 @@ void face_measure(const geometry::Geometry& geom, std::size_t pt, int f, double 
   nz = -tx / ds;
 }
 
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kSqrtHalf = 0.70710678118654752440;
+
+// Solves A x = b in place (b becomes x) for a small symmetric positive
+// definite A (n <= 3, row-major), by Gaussian elimination without pivoting.
+void solve_spd(int n, double* A, double* b) {
+  for (int k = 0; k < n; ++k) {
+    for (int i = k + 1; i < n; ++i) {
+      const double l = A[i * n + k] / A[k * n + k];
+      for (int j = k; j < n; ++j) A[i * n + j] -= l * A[k * n + j];
+      b[i] -= l * b[k];
+    }
+  }
+  for (int k = n - 1; k >= 0; --k) {
+    double s = b[k];
+    for (int j = k + 1; j < n; ++j) s -= A[k * n + j] * b[j];
+    b[k] = s / A[k * n + k];
+  }
+}
+
 template <class T>
 double dot(const std::vector<T>& a, const std::vector<T>& b) {
   double s = 0.0;
@@ -73,7 +93,10 @@ Solver::Solver(const Problem& p)
       lagrange_(p.gll.points),
       glj_(basis::glj01(p.gll.size())),
       lagrange_glj_(glj_.points),
-      axisym_(p.forest.macro().coord_system() == mesh::CoordSystem::Axisymmetric) {
+      axisym_(p.forest.macro().coord_system() == mesh::CoordSystem::Axisymmetric),
+      azimuthal_order_(p.azimuthal_order) {
+  INSEM_CHECK(azimuthal_order_ == 0 || (azimuthal_order_ == 1 && axisym_),
+              "azimuthal order " << azimuthal_order_ << " needs an axisymmetric mesh (supported orders: 0, 1)");
   INSEM_CHECK(p.gll.size() >= physics::kMinNgll && p.gll.size() <= physics::kMaxNgll,
               "polynomial order " << p.gll.size() - 1 << " is not supported by the kernels (1.."
                                   << physics::kMaxNgll - 1 << ")");
@@ -133,7 +156,15 @@ void Solver::build_domains(const Problem& p) {
   for (Medium medium : {Medium::Acoustic, Medium::Elastic}) {
     Domain d;
     d.medium = medium;
-    d.ncomp = medium == Medium::Elastic ? 2 : 1;
+    d.azimuthal_order = azimuthal_order_;
+    d.ncomp = medium == Medium::Elastic ? (azimuthal_order_ == 1 ? 3 : 2) : 1;
+    if (axisym_) {
+      if (medium == Medium::Elastic) {
+        d.axis_components = azimuthal_order_ == 1 ? std::vector<int>{0, 2} : std::vector<int>{0};
+      } else if (azimuthal_order_ == 1) {
+        d.axis_components = {0};
+      }
+    }
     d.element_of_leaf.assign(p.forest.n_leaves(), -1);
     for (index_t l = 0; l < p.forest.n_leaves(); ++l) {
       if (material_of_leaf(p, l).medium == medium) {
@@ -192,7 +223,7 @@ void Solver::build_domains(const Problem& p) {
       }
     }
     if (axisym_) {
-      d.blocks = {ops::build_axisym_block(d.leaves, p.geometry, coef0, coef1, wr, hoop, axial)};
+      d.blocks = {ops::build_axisym_block(d.leaves, p.geometry, coef0, coef1, wr, hoop, axial, azimuthal_order_)};
     } else {
       d.blocks = ops::build_blocks(d.leaves, p.geometry, coef0, coef1);
     }
@@ -216,9 +247,7 @@ void Solver::build_domains(const Problem& p) {
       const std::size_t q = static_cast<std::size_t>(d.leaves[s / npe]) * npe + s % npe;
       d.coords[g] = p.geometry.x[q];
       d.coords[ng + g] = p.geometry.z[q];
-      if (axisym_ && medium == Medium::Elastic && p.geometry.x[q] <= 0.0) {
-        d.axis_points.push_back(static_cast<index_t>(g));  // u_r = 0 on the axis
-      }
+      if (!d.axis_components.empty() && p.geometry.x[q] <= 0.0) d.axis_points.push_back(static_cast<index_t>(g));
     }
     domains_.push_back(std::move(d));
   }
@@ -232,7 +261,8 @@ void Solver::build_boundaries(const Problem& p, Domain& d) {
 
   const int ngll = geom.ngll;
   const int n = ngll - 1;
-  std::map<index_t, std::array<double, 3>> absorbing;  // ordered: deterministic
+  const int nc = d.ncomp;
+  std::map<index_t, std::array<double, 9>> absorbing;  // ordered: deterministic; [nc][nc]
   std::set<index_t> dirichlet;
 
   for (std::size_t e = 0; e < d.leaves.size(); ++e) {
@@ -268,23 +298,39 @@ void Solver::build_boundaries(const Problem& p, Domain& d) {
         double w, nx, nz;
         face_weight(p, leaf, f, i, j, w, nx, nz);
         auto& acc = absorbing[g];
-        if (d.medium == Medium::Elastic) {
-          double cxx, czz, cxz;
-          physics::stacey_elastic(w, mat.rho, mat.vp, mat.vs, nx, nz, cxx, czz, cxz);
-          acc[0] += cxx;
-          acc[1] += czz;
-          acc[2] += cxz;
-        } else {
+        if (d.medium == Medium::Acoustic) {
           acc[0] += physics::stacey_acoustic(w, mat.rho, mat.vp);
+          continue;
+        }
+        double cxx, czz, cxz;
+        physics::stacey_elastic(w, mat.rho, mat.vp, mat.vs, nx, nz, cxx, czz, cxz);
+        if (nc == 2) {
+          acc[0] += cxx;
+          acc[1] += cxz;
+          acc[2] += cxz;
+          acc[3] += czz;
+        } else {
+          // C = w rho [vp n n^T + vs (I - n n^T)] in (r, theta, z), theta
+          // tangential, transformed to (U+, U-, U_z): T C T^T.
+          const double ct = w * mat.rho * mat.vs;
+          const double cpp = 0.5 * (cxx + ct), cpm = 0.5 * (cxx - ct), cpz = kSqrtHalf * cxz;
+          const double c[9] = {cpp, cpm, cpz, cpm, cpp, cpz, cpz, cpz, czz};
+          for (int s = 0; s < 9; ++s) acc[s] += c[s];
         }
       }
     }
   }
-  const int stride = d.medium == Medium::Elastic ? 3 : 1;
-  for (const auto& [g, c] : absorbing) {
+  const std::set<index_t> axis(d.axis_points.begin(), d.axis_points.end());
+  for (auto [g, c] : absorbing) {
     if (dirichlet.count(g)) continue;  // Dirichlet wins at shared corners
+    if (axis.count(g)) {
+      // Components fixed on the axis are decoupled from the damping.
+      for (int ac : d.axis_components) {
+        for (int s = 0; s < nc; ++s) c[ac * nc + s] = c[s * nc + ac] = 0.0;
+      }
+    }
     d.absorbing_points.push_back(g);
-    for (int s = 0; s < stride; ++s) d.absorbing_coef.push_back(static_cast<real_t>(c[s]));
+    for (int s = 0; s < nc * nc; ++s) d.absorbing_coef.push_back(static_cast<real_t>(c[s]));
   }
   d.dirichlet_points.assign(dirichlet.begin(), dirichlet.end());
 }
@@ -392,47 +438,71 @@ void Solver::build_sources(const Problem& p) {
     const PointWeights w = point_weights(p.forest, axial ? lagrange_glj_ : lagrange_, lagrange_, *loc);
     const index_t e = d.element_of_leaf[loc->leaf];
     const int npe = d.dofs.points_per_element();
-    // Axisymmetric: the weak form is per radian, so source strengths are
-    // divided by 2 pi. On the axis this is a 3D point source of the given
-    // strength; off the axis it is a ring source of that total strength.
-    const double scale = axisym_ ? 1.0 / (2.0 * 3.14159265358979323846) : 1.0;
+    // Axisymmetric: the weak form is per radian (azimuthal order 0, the
+    // theta integral of 1) or per pi (order 1, the integral of cos^2), so
+    // source strengths are divided by 2 pi or pi. On the axis this is a 3D
+    // point source of the given strength; off the axis a ring source of that
+    // net strength (docs/DESIGN.md §2.4, §2.5).
+    const double scale = !axisym_ ? 1.0 : azimuthal_order_ == 1 ? 1.0 / kPi : 1.0 / (2.0 * kPi);
     const double rs = src.position[0];
+    const auto& c = src.components;
+    const bool directional = src.kind == Source::Kind::Force || src.kind == Source::Kind::Dipole;
     if (axisym_) {
       const bool on_axis = std::abs(rs) <= 1e-12 * (1.0 + std::abs(src.position[1]));
-      INSEM_CHECK(!(on_axis && src.kind == Source::Kind::Force && src.components[0] != 0.0),
-                  "source " << si << ": a radial force on the axis is not axisymmetric");
-      INSEM_CHECK(!(on_axis && src.kind == Source::Kind::MomentTensor && src.components[2] != 0.0),
-                  "source " << si << ": an M_rz moment on the axis is not axisymmetric");
+      if (azimuthal_order_ == 0) {
+        INSEM_CHECK(!(on_axis && directional && c[0] != 0.0),
+                    "source " << si << ": a radial force or dipole on the axis is not axisymmetric (it is "
+                              << "azimuthal order 1)");
+        INSEM_CHECK(!(on_axis && src.kind == Source::Kind::MomentTensor && c[2] != 0.0),
+                    "source " << si << ": an M_rz moment on the axis is not axisymmetric");
+      } else {
+        INSEM_CHECK(directional, "source " << si << " (" << src.kind_name()
+                                           << "): azimuthal order 1 takes force and dipole sources only");
+        INSEM_CHECK(!(on_axis && c[1] != 0.0),
+                    "source " << si << ": a vertical force or dipole on the axis is axisymmetric (azimuthal "
+                              << "order 0)");
+      }
     }
+    const double rho = material_of_leaf(p, loc->leaf).rho;
+    const bool pm = d.medium == Medium::Elastic && d.azimuthal_order == 1;
 
     // Force on each local point, then distributed to global points through
     // the slot's constraint row (C^T), accumulated in global order.
-    std::map<index_t, std::array<double, 2>> acc;
-    const auto& c = src.components;
+    std::map<index_t, std::array<double, 3>> acc;
     for (int k = 0; k < npe; ++k) {
-      double fx = 0.0, fz = 0.0;
+      double fc[3] = {0.0, 0.0, 0.0};
       switch (src.kind) {
         case Source::Kind::Force:
-          fx = c[0] * w.value[k];
-          fz = c[1] * w.value[k];
+          if (pm) {
+            // f_x W_r = f_x (W+ + W-) / sqrt 2, f_z W_z.
+            fc[0] = fc[1] = kSqrtHalf * c[0] * w.value[k];
+            fc[2] = c[1] * w.value[k];
+          } else {
+            fc[0] = c[0] * w.value[k];
+            fc[1] = c[1] * w.value[k];
+          }
           break;
         case Source::Kind::MomentTensor:
           // Equivalent body force -div(M delta): f_a(p) = M_ab d_b phi_p(x_s).
-          fx = c[0] * w.d_dx[k] + c[2] * w.d_dz[k];
-          fz = c[2] * w.d_dx[k] + c[1] * w.d_dz[k];
+          fc[0] = c[0] * w.d_dx[k] + c[2] * w.d_dz[k];
+          fc[1] = c[2] * w.d_dx[k] + c[1] * w.d_dz[k];
           if (axisym_) {
             // Hoop part M_tt eps_tt(phi), with M_tt = M_rr: phi / r, or
             // dphi/dr on the axis.
-            fx += c[0] * (rs > 0.0 ? w.value[k] / rs : w.d_dx[k]);
+            fc[0] += c[0] * (rs > 0.0 ? w.value[k] / rs : w.d_dx[k]);
           }
           break;
         case Source::Kind::Monopole:
-          fx = w.value[k];
+          fc[0] = w.value[k];
+          break;
+        case Source::Kind::Dipole:
+          // (1/kappa) p_tt = div(grad p / rho) - div(f delta / rho): the
+          // weak form gets f . grad phi(x_s) / rho.
+          fc[0] = (c[0] * w.d_dx[k] + c[1] * w.d_dz[k]) / rho;
           break;
       }
       for (const auto& [g, wt] : d.dofs.slot_entries(e, k)) {
-        acc[g][0] += wt * fx * scale;
-        acc[g][1] += wt * fz * scale;
+        for (int comp = 0; comp < d.ncomp; ++comp) acc[g][comp] += wt * fc[comp] * scale;
       }
     }
     SourceTerm term;
@@ -488,7 +558,7 @@ void Solver::build_receivers(const Problem& p) {
       Trace t;
       t.receiver = rec.name;
       t.quantity = q;
-      t.ncomp = quantity_components(q, d.medium);
+      t.ncomp = quantity_components(q, d.medium, d.azimuthal_order);
       term.trace_index.push_back(traces_.size());
       term.quantities.push_back(q);
       traces_.push_back(std::move(t));
@@ -623,23 +693,35 @@ void Solver::compute_acceleration(double t, bool energy, bool damping_implicit) 
 void Solver::add_coupling_forces(Domain& d) {
   const std::size_t n = coupling_.fluid_points.size();
   if (n == 0) return;
+  // Azimuthal order 1: the radial part goes to (or comes from) U+ and U-
+  // alike, U_r = (U+ + U-) / sqrt 2; the theta component takes no traction.
+  const bool pm = d.azimuthal_order == 1;
+  const real_t h = static_cast<real_t>(kSqrtHalf);
   if (d.medium == Medium::Elastic) {
     // Traction p n_f on the solid.
     const Domain& fluid = domains_[domain_index(Medium::Acoustic)];
     const std::size_t ng = static_cast<std::size_t>(d.n_global());
+    const std::size_t zc = pm ? 2 * ng : ng;
     for (std::size_t i = 0; i < n; ++i) {
       const real_t p = fluid.u[coupling_.fluid_points[i]];
       const std::size_t g = coupling_.solid_points[i];
-      d.f[g] += coupling_.cx[i] * p;
-      d.f[ng + g] += coupling_.cz[i] * p;
+      if (pm) {
+        d.f[g] += h * coupling_.cx[i] * p;
+        d.f[ng + g] += h * coupling_.cx[i] * p;
+      } else {
+        d.f[g] += coupling_.cx[i] * p;
+      }
+      d.f[zc + g] += coupling_.cz[i] * p;
     }
   } else {
     // -n_f . a_s on the fluid.
     const Domain& solid = domains_[domain_index(Medium::Elastic)];
     const std::size_t ngs = static_cast<std::size_t>(solid.n_global());
+    const std::size_t zc = pm ? 2 * ngs : ngs;
     for (std::size_t i = 0; i < n; ++i) {
       const std::size_t gs = coupling_.solid_points[i];
-      d.f[coupling_.fluid_points[i]] -= coupling_.cx[i] * solid.a[gs] + coupling_.cz[i] * solid.a[ngs + gs];
+      const real_t ar = pm ? h * (solid.a[gs] + solid.a[ngs + gs]) : solid.a[gs];
+      d.f[coupling_.fluid_points[i]] -= coupling_.cx[i] * ar + coupling_.cz[i] * solid.a[zc + gs];
     }
   }
 }
@@ -656,31 +738,25 @@ void Solver::solve_acceleration(Domain& d, bool damping_implicit) {
   }
 
   // Stacey points: the damping force -C v uses v^{n+1} = v^{n+1/2} + dt/2 a,
-  // i.e. (M + dt/2 C) a = f - C v^{n+1/2}, solved per point (C is 2x2 or
-  // scalar). Treating the damping implicitly keeps it unconditionally
+  // i.e. (M + dt/2 C) a = f - C v^{n+1/2}, solved per point (C is
+  // ncomp x ncomp). Treating the damping implicitly keeps it unconditionally
   // stable; at t = 0 the velocity is known and the term is explicit.
   const double h = damping_implicit ? 0.5 * dt_ : 0.0;
   const std::size_t nabs = d.absorbing_points.size();
-  if (d.medium == Medium::Elastic) {
-    for (std::size_t i = 0; i < nabs; ++i) {
-      const std::size_t g = d.absorbing_points[i];
-      const double cxx = d.absorbing_coef[3 * i], czz = d.absorbing_coef[3 * i + 1],
-                   cxz = d.absorbing_coef[3 * i + 2];
-      const double vx = d.v[g], vz = d.v[ng + g];
-      const double rx = d.f[g] - (cxx * vx + cxz * vz);
-      const double rz = d.f[ng + g] - (cxz * vx + czz * vz);
-      const double m = d.mass[g];
-      const double a11 = m + h * cxx, a22 = m + h * czz, a12 = h * cxz;
-      const double det = a11 * a22 - a12 * a12;
-      d.a[g] = static_cast<real_t>((a22 * rx - a12 * rz) / det);
-      d.a[ng + g] = static_cast<real_t>((a11 * rz - a12 * rx) / det);
+  const std::size_t nc2 = static_cast<std::size_t>(ncomp) * ncomp;
+  for (std::size_t i = 0; i < nabs; ++i) {
+    const std::size_t g = d.absorbing_points[i];
+    const real_t* c = &d.absorbing_coef[nc2 * i];
+    double A[9], rhs[3];
+    for (int r = 0; r < ncomp; ++r) {
+      rhs[r] = d.f[r * ng + g];
+      for (int s = 0; s < ncomp; ++s) {
+        rhs[r] -= static_cast<double>(c[r * ncomp + s]) * d.v[s * ng + g];
+        A[r * ncomp + s] = h * c[r * ncomp + s] + (r == s ? static_cast<double>(d.mass[g]) : 0.0);
+      }
     }
-  } else {
-    for (std::size_t i = 0; i < nabs; ++i) {
-      const std::size_t g = d.absorbing_points[i];
-      const double c = d.absorbing_coef[i];
-      d.a[g] = static_cast<real_t>((d.f[g] - c * d.v[g]) / (d.mass[g] + h * c));
-    }
+    solve_spd(ncomp, A, rhs);
+    for (int r = 0; r < ncomp; ++r) d.a[r * ng + g] = static_cast<real_t>(rhs[r]);
   }
   d.apply_dirichlet(d.a);
 }
@@ -721,6 +797,14 @@ void Solver::record() {
         continue;
       }
       const std::vector<real_t>& field = (q == "velocity") ? d.v : (q == "acceleration") ? d.a : d.u;
+      if (d.medium == Medium::Elastic && d.azimuthal_order == 1) {
+        // (U+, U-) -> (U_r, U_theta)
+        const double up = interpolate(field, 0), um = interpolate(field, 1);
+        t.data.push_back(kSqrtHalf * (up + um));
+        t.data.push_back(kSqrtHalf * (up - um));
+        t.data.push_back(interpolate(field, 2));
+        continue;
+      }
       for (int c = 0; c < t.ncomp; ++c) t.data.push_back(interpolate(field, c));
     }
   }
@@ -734,10 +818,21 @@ void Solver::record_snapshot() {
     // d.u_local is kernel scratch, free between steps.
     d.dofs.gather(field.data(), d.u_local.data(), d.ncomp);
     const std::size_t npe = static_cast<std::size_t>(d.dofs.points_per_element());
+    const std::size_t base = snap.data.size();
     for (int c = 0; c < d.ncomp; ++c) {
       for (std::size_t e = 0; e < d.leaves.size(); ++e) {
         const real_t* src = &d.u_local[(e * d.ncomp + c) * npe];
         snap.data.insert(snap.data.end(), src, src + npe);
+      }
+    }
+    if (d.medium == Medium::Elastic && d.azimuthal_order == 1) {
+      // (U+, U-) -> (U_r, U_theta)
+      const std::size_t n = d.leaves.size() * npe;
+      float* x = &snap.data[base];
+      for (std::size_t i = 0; i < n; ++i) {
+        const double up = x[i], um = x[n + i];
+        x[i] = static_cast<float>(kSqrtHalf * (up + um));
+        x[n + i] = static_cast<float>(kSqrtHalf * (up - um));
       }
     }
   }
@@ -876,6 +971,8 @@ void Solver::write_results(const std::string& path) const {
   f.set_attribute("/", "n_steps", static_cast<std::int64_t>(n_steps_));
   f.set_attribute("/", "steps_done", static_cast<std::int64_t>(step_));
   f.set_attribute("/", "record_every", static_cast<std::int64_t>(record_every_));
+  f.set_attribute("/", "coords", std::string(axisym_ ? "axisymmetric" : "cartesian"));
+  f.set_attribute("/", "azimuthal_order", static_cast<std::int64_t>(azimuthal_order_));
   f.write("/time", sample_times_);
   for (const Trace& t : traces_) {
     const std::size_t n = t.data.size() / static_cast<std::size_t>(t.ncomp);

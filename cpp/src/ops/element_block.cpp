@@ -7,13 +7,14 @@ namespace insem::ops {
 ElementBlock build_axisym_block(const std::vector<index_t>& leaves, const geometry::Geometry& geom,
                                 const std::vector<double>& coef0, const std::vector<double>& coef1,
                                 const std::vector<double>& wr, const std::vector<double>& hoop,
-                                const std::vector<char>& axial) {
+                                const std::vector<char>& axial, int azimuthal_order) {
   const std::size_t npe = static_cast<std::size_t>(geom.ngll) * geom.ngll;
   INSEM_CHECK(wr.size() == leaves.size() * npe && hoop.size() == wr.size() && axial.size() == leaves.size(),
               "axisymmetric weights do not match the domain size");
   ElementBlock b;
   b.kind = geometry::GeometryKind::Axisym;
   b.axial = axial;
+  b.azimuthal_order = azimuthal_order;
   for (std::size_t e = 0; e < leaves.size(); ++e) {
     b.elements.push_back(static_cast<index_t>(e));
     const std::size_t p0 = static_cast<std::size_t>(leaves[e]) * npe;

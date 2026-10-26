@@ -48,7 +48,7 @@ References include Patera 1984, Maday & Rønquist 1990, Komatitsch & Vilotte
 | Language | C++17 core, Python bindings (pybind11) |
 | Dimensions | 2D first (Cartesian **and** axisymmetric r–z); designed so 3D (hex, octree) slots in |
 | Physics v1 | isotropic acoustic (**pressure**) + isotropic elastic + **fluid–solid coupling** |
-| Physics later | anisotropy (VTI/TTI), attenuation, topography, azimuthal Fourier (2.5D) |
+| Physics later | anisotropy (VTI/TTI), attenuation, topography, azimuthal orders m ≥ 2 (m = 0, 1 done in M3–M4) |
 | Meshing | conforming **macro-mesh** (in-house layered/borehole templates or Gmsh import) refined by a **forest of quadtrees** with hanging nodes |
 | Operators | matrix-free, element blocks, deterministic gather/scatter |
 | Time stepping | pluggable integrators (central difference first), local time stepping planned |
@@ -147,8 +147,9 @@ head waves, Stoneley, pseudo-Rayleigh) at 2D cost.
 
 **Limitation:** pure axisymmetry (m = 0) only allows on-axis sources with
 axisymmetric radiation. That covers the monopole sonic source, an explosion
-and a vertical force. The dipole needs §2.5. General off-axis microseismic
-moment tensors need full 3D, so v1 microseismic work is done in 2D Cartesian (P–SV).
+and a vertical force. The dipole uses §2.5 (implemented in M4). General
+off-axis microseismic moment tensors need full 3D, so v1 microseismic work is
+done in 2D Cartesian (P–SV).
 
 ### 2.5 Azimuthal Fourier modes (2.5D): dipole logging
 
@@ -165,13 +166,49 @@ order m, and each mode is an independent 2D problem on the **same r–z mesh**:
   path and can be added later.
 * Axis conditions depend on the mode, and the GLJ axial quadrature handles the
   1/r and 1/r² terms (Nissen-Meyer et al. 2007). For m = 1: u_z = 0,
-  u_r^1 + u_θ^1 = 0 and p^1 = 0 on the axis (the exact sign depends on the
-  cos/sin convention and is fixed in the implementation notes).
+  u_r^1 + u_θ^1 = 0 and p^1 = 0 on the axis (with the convention below).
 * Fluid–solid coupling, Stacey boundaries and the element-block structure carry
   over per mode. Each m is a separate geometry/physics block family.
 * A dipole source in the fluid is a point force density **f**:
   (1/κ) p̈ = ∇·(1/ρ ∇p) − ∇·(**f**/ρ), so it enters through ∇w. Receivers
   output the mode amplitude, and the azimuthal pattern (cos θ) is applied in post-processing.
+* **Implemented (M4), m = 0 and m = 1** (`Discretization.azimuthal_order`):
+  * Convention: u = (U_r cos θ, U_θ sin θ, U_z cos θ), p = P cos θ. The
+    elastic unknowns are stored as the orthonormal pair U± = (U_r ± U_θ)/√2
+    and U_z, so the mass matrix stays diagonal and the same for each component,
+    and the axis conditions are plain Dirichlet conditions: U₊ = U_z = 0
+    (and P = 0) on the axis. U₋ is free there; it is √2 times the Cartesian
+    u_x on the axis.
+  * Strains: e_rr = ∂_r U_r, e_zz = ∂_z U_z, e_θθ = √2 U₊/r,
+    γ_rz = ∂_z U_r + ∂_r U_z, γ_rθ = ∂_r U_θ − √2 U₊/r, γ_θz = ∂_z U_θ − U_z/r.
+    On the axis U₊/r → ∂_r U₊ and U_z/r → ∂_r U_z, on the trial and the test
+    side, as for m = 0, so the operator stays symmetric and energy is
+    conserved exactly. Acoustic: −∫(1/ρ)[∇W·∇P + WP/r²] r, with P/r → ∂_r P
+    on the axis.
+  * The weak form is per π (the θ integral of cos²), so source strengths
+    are divided by π. A horizontal force on the axis drives U₋; a fluid
+    dipole adds **f**·∇w/ρ. Off the axis, a source is a ring whose density
+    varies as cos θ, with net force (f_x, 0, 0). Monopoles, moment tensors
+    and vertical forces on the axis are rejected in m = 1, and horizontal
+    forces or dipoles on the axis are rejected in m = 0.
+  * Stacey: C = wρ[v_p nnᵀ + v_s(I − nnᵀ)] with θ tangential, transformed
+    to (U₊, U₋, U_z). It is a dense ncomp × ncomp matrix per boundary point,
+    solved implicitly. Rows and columns of axis-fixed components are dropped
+    at axis points. Coupling: the solid gets p n_f split equally onto U₊ and
+    U₋ (U_r = (U₊ + U₋)/√2), and the fluid gets −n_f·a with
+    a_r = (a₊ + a₋)/√2.
+  * Receivers, snapshots and results files hold (U_r, U_θ, U_z) and P, the
+    values at θ = 0 (U_θ at θ = 90°). The raw solver state keeps (U₊, U₋, U_z).
+  * References: the discrete-wavenumber solver handles order m with I_m/K_m
+    and the potentials (Φ, X, H) (`reference.borehole_dipole_pressure`). The
+    same global matrix at real frequency gives modal root-finding of the
+    Stoneley and flexural dispersion (`reference.borehole_mode_slowness`).
+    `post.dispersion` estimates phase slowness from an array
+    (frequency–slowness semblance).
+  * **Finding:** a dipole in a slow formation radiates a strong formation P
+    wave. Its first-order Stacey reflection from the outer boundary (a few %)
+    must arrive after the recording window. At 3 kHz the outer radius has to
+    be ≳ 4 m for an array at 1–2.4 m.
 
 ### 2.6 Later physics (designed for, not built)
 
@@ -258,7 +295,8 @@ its derivative) gives the weights.
 * Point force and **moment tensor** (solid) for microseismic. 2D Cartesian
   uses M_xx, M_zz and M_xz; axisymmetric mode allows on-axis axisymmetric parts only.
 * Volume-injection monopole (fluid) for borehole sonic sources (§2.2).
-* Dipole: a point force in the fluid or solid, run in mode m = 1 (§2.5).
+* Dipole: a point force in the fluid (`Source.dipole`) or the solid
+  (`Source.force`), run in mode m = 1 (§2.5).
 * Source time functions: Ricker, Gaussian and derivatives, smoothed step, or a user array.
 * Any number of sources, for multi-event microseismic catalogues.
 
@@ -486,8 +524,8 @@ HDF5 `results.h5`:
 | Energy conservation, closed box, with and without LTS | constant to round-off (leapfrog / Diaz–Grote energy) |
 | Stacey reflection vs incidence angle | larger-domain reference |
 | Axisym point sources on axis | analytic 3D spherical waves |
-| Borehole monopole and dipole, open and cased hole (homogeneous formation) | in-house discrete-wavenumber reference with radial propagator matrices (Tsang & Rader 1979; Kurkjian & Chang 1986; Tubman et al. 1984 for cased holes) |
-| Stoneley and flexural dispersion | modal root-finding of the borehole dispersion relation vs SEM-extracted dispersion |
+| Borehole monopole and dipole, open and cased hole (homogeneous formation) | in-house discrete-wavenumber reference with radial propagator matrices (Tsang & Rader 1979; Kurkjian & Chang 1986; Tubman et al. 1984 for cased holes) (implemented: monopole open/cased, dipole open hole) |
+| Stoneley and flexural dispersion | modal root-finding of the borehole dispersion relation vs SEM-extracted dispersion (implemented) |
 | DAS gauge-length response | strain from analytic displacement |
 | CPU vs CUDA (strict build), 1 vs N ranks | **bitwise** identical |
 
@@ -525,7 +563,7 @@ problems fit on one node or GPU; it becomes essential for 3D.
 | **M1** 2D Cartesian core (CPU) ✅ | elastic + acoustic (pressure) element blocks, leapfrog, Stacey, free/rigid boundaries, forcings, point receivers, energy monitor, layered template, OpenMP | analytic 2D Green's functions, Rayleigh speed, convergence, energy |
 | **M2** Coupling + refinement ✅ | fluid–solid coupling, adaptive quadtree + 2:1 balance + hanging nodes, Gmsh import, SEG-Y/XDMF, YAML | normal-incidence R/T, Scholte speed, refinement-interface reflection, Lamb's problem (wavenumber integration) |
 | **M3** Axisymmetric monopole ✅ | axisym blocks (GLJ axis), borehole template (open/cased hole, beds), monopole source, DWM reference solver, STC post-processing | 3D analytic on axis (0.05–0.7 %), DWM open (0.2–0.9 %) and cased hole (0.2–0.6 %), STC picks identical to the reference |
-| **M4** Dipole (2.5D, m = 1) | azimuthal-mode blocks, mode-dependent axis conditions, dipole source and receivers, flexural dispersion tools | DWM dipole, flexural dispersion |
+| **M4** Dipole (2.5D, m = 1) ✅ | azimuthal-mode blocks, mode-dependent axis conditions, dipole source and receivers, flexural dispersion tools | exactness and energy; 3D analytic horizontal force and fluid dipole (0.1–1 %); DWM dipole in a slow formation (0.3–0.4 %); flexural STC and dispersion vs modal root-finding (≤ 0.6 % at 3–5 kHz) |
 | **M5** CUDA backend | all blocks + gather/scatter + observers on GPU, strict-FP mode, batched multi-simulation runs | bitwise CPU/CUDA equivalence, performance |
 | **M6** C-PML | PML blocks (all geometry kinds, including axisym and modes), LDDRK | reflection vs Stacey, guided-wave absorption |
 | **M7** Local time stepping | Diaz–Grote multi-rate leapfrog, per-level blocks | energy, accuracy, speed-up on cased-hole cases |
@@ -533,5 +571,5 @@ problems fit on one node or GPU; it becomes essential for 3D.
 | **M9** 3D | hex blocks, octree forest, deviated wells, 3D microseismic, DAS fibers | 3D analytic, Lamb 3D |
 | Later | quadrupole (m = 2), tool body, VTI, attenuation, topography, adjoint/inversion | |
 
-M0–M4 can be developed and fully verified in this environment (CPU). M5 and
+M0–M4 were developed and verified in this environment (CPU). M5 and
 M8 need your GPU and MPI hardware for final validation.

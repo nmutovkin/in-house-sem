@@ -99,3 +99,23 @@ def test_segy_errors(coupled_run, tmp_path):
         post.write_segy(path, tmp_path / "x.sgy", "velocity", receivers=["h"])
     with pytest.raises(ValueError, match="component"):
         post.write_segy(path, tmp_path / "x.sgy", "pressure", component=1)
+
+
+def test_dispersion_recovers_a_dispersive_mode():
+    # A wave with phase slowness s(f) = 1000 + 20 (f / 1 kHz) us/m, built in
+    # the frequency domain, plus an earlier non-dispersive arrival that the
+    # mute removes.
+    dt, n = 1e-5, 2048
+    t = np.arange(n) * dt
+    z = 1.0 + 0.15 * np.arange(8)
+    f = np.fft.rfftfreq(n, dt)
+    src = np.fft.rfft(insem.ricker(3000.0, t0=1e-3)(t))
+    s_true = lambda ff: 1e-3 + 20e-6 * ff / 1000.0  # noqa: E731
+    x = np.array([np.fft.irfft(src * np.exp(-2j * np.pi * f * s_true(f) * zz), n) for zz in z])
+    early = np.array([insem.ricker(3000.0, t0=0.5e-3 + 4e-4 * zz)(t) for zz in z])
+    freqs = np.array([2000.0, 3000.0, 4000.0])
+    grid = np.linspace(800e-6, 1300e-6, 1001)
+    d = post.dispersion(x + early, z, dt, freqs, grid, mute=(1.6e-3, 0.9e-3))
+    s, c = d.peak()
+    np.testing.assert_allclose(s, s_true(freqs), atol=1e-6)
+    assert c.min() > 0.99

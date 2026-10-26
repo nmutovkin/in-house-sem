@@ -301,6 +301,10 @@ PYBIND11_MODULE(_core, m) {
                   py::arg("mzz"), py::arg("mxz"), py::arg("stf"))
       .def_static("monopole", &Source::monopole, py::arg("x"), py::arg("z"), py::arg("stf"),
                   "Acoustic volume-injection source; stf is d^2Q/dt^2 (m^3/s^2 per unit length in 2D).")
+      .def_static("dipole", &Source::dipole, py::arg("x"), py::arg("z"), py::arg("fx"), py::arg("fz"),
+                  py::arg("stf"),
+                  "Acoustic point force (pressure dipole) of direction (fx, fz) in N; stf is the force time "
+                  "function. In axisymmetric models a horizontal dipole on the axis needs azimuthal_order=1.")
       .def_property_readonly("kind", &Source::kind_name)
       .def_readonly("position", &Source::position)
       .def_readonly("components", &Source::components)
@@ -351,7 +355,8 @@ PYBIND11_MODULE(_core, m) {
         };
         return py::make_tuple(conv(d.u), conv(d.v), conv(d.a));
       }, py::arg("medium"),
-           "(field, first, second time derivative), each (ncomp, n_points): displacement (elastic) or pressure (acoustic).")
+           "(field, first, second time derivative), each (ncomp, n_points): displacement (elastic) or pressure "
+           "(acoustic). Azimuthal order 1 elastic components are (U+, U-, U_z), U+- = (U_r +- U_theta) / sqrt 2.")
       .def("set_state", [](solver::Solver& s, const std::string& medium, const CArray<double>& u,
                            const CArray<double>& v) {
         s.set_state(medium_from_string(medium), to_vector(u), to_vector(v));
@@ -394,8 +399,10 @@ PYBIND11_MODULE(_core, m) {
   // ---- simulation
   py::class_<Discretization>(m, "Discretization")
       .def(py::init([](int order, int uniform_level, double f_max, double ppw, int max_level,
-                       const std::vector<std::tuple<double, double, double, double, int>>& regions) {
+                       const std::vector<std::tuple<double, double, double, double, int>>& regions,
+                       int azimuthal_order) {
              Discretization d;
+             d.azimuthal_order = azimuthal_order;
              d.order = order;
              d.uniform_level = uniform_level;
              d.f_max = f_max;
@@ -407,14 +414,17 @@ PYBIND11_MODULE(_core, m) {
            py::arg("order") = 4, py::arg("uniform_level") = 0, py::arg("f_max") = 0.0,
            py::arg("points_per_wavelength") = 5.0, py::arg("max_level") = 12,
            py::arg("regions") = std::vector<std::tuple<double, double, double, double, int>>{},
+           py::arg("azimuthal_order") = 0,
            "Element order and refinement: uniform levels, then adaptive refinement to points_per_wavelength "
            "at f_max (0 = off) and to the levels of regions [(xmin, xmax, zmin, zmax, level), ...], "
-           "capped at max_level; then 2:1 balance.")
+           "capped at max_level; then 2:1 balance. azimuthal_order (axisymmetric meshes): 0 for "
+           "axisymmetric fields (monopole), 1 for fields varying as cos(theta) (dipole).")
       .def_readonly("order", &Discretization::order)
       .def_readonly("uniform_level", &Discretization::uniform_level)
       .def_readonly("f_max", &Discretization::f_max)
       .def_readonly("points_per_wavelength", &Discretization::points_per_wavelength)
       .def_readonly("max_level", &Discretization::max_level)
+      .def_readonly("azimuthal_order", &Discretization::azimuthal_order)
       .def_property_readonly("regions", [](const Discretization& d) {
         std::vector<std::tuple<double, double, double, double, int>> out;
         for (const auto& r : d.regions) out.emplace_back(r.xmin, r.xmax, r.zmin, r.zmax, r.level);

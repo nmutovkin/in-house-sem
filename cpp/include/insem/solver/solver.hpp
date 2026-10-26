@@ -19,11 +19,13 @@
 namespace insem::solver {
 
 // The leaves of one medium, with their own numbering and fields. Elastic
-// fields have 2 components (u_x, u_z); acoustic fields have 1 (pressure).
-// Global arrays are [component][global point].
+// fields have 2 components (u_x, u_z; axisymmetric u_r, u_z), or in
+// azimuthal order 1 three (U+, U-, U_z, docs/DESIGN.md §2.5); acoustic
+// fields have 1 (pressure). Global arrays are [component][global point].
 struct Domain {
   Medium medium = Medium::Elastic;
   int ncomp = 2;
+  int azimuthal_order = 0;
   std::vector<index_t> leaves;           // forest leaf of each domain element
   std::vector<index_t> element_of_leaf;  // inverse map, -1 for leaves of other domains
   ops::DofMap dofs;
@@ -32,15 +34,17 @@ struct Domain {
   std::vector<real_t> mass;      // assembled diagonal mass [n_global]
   std::vector<real_t> inv_mass;  // its inverse
 
-  // Stacey: global points and their accumulated coefficients
-  // (elastic: cxx, czz, cxz per point; acoustic: c per point).
+  // Stacey: global points and their accumulated damping matrices
+  // (ncomp x ncomp per point, row-major, in the domain's components).
   std::vector<index_t> absorbing_points;
   std::vector<real_t> absorbing_coef;
   // Global points with a homogeneous Dirichlet condition (rigid elastic,
-  // pressure-release acoustic), and (axisymmetric elastic) points on the
-  // axis, where the radial component vanishes.
+  // pressure-release acoustic), and (axisymmetric) points on the axis with
+  // the components that vanish there: u_r (m = 0 elastic), U+ and U_z
+  // (m = 1 elastic), P (m = 1 acoustic).
   std::vector<index_t> dirichlet_points;
   std::vector<index_t> axis_points;
+  std::vector<int> axis_components;
 
   std::vector<real_t> u, v, a, f;  // field, its first and second time derivative, force
   std::vector<real_t> u_local, f_local;
@@ -55,7 +59,9 @@ struct Domain {
     for (int c = 0; c < ncomp; ++c) {
       for (index_t g : dirichlet_points) x[c * ng + g] = 0;
     }
-    for (index_t g : axis_points) x[g] = 0;
+    for (int c : axis_components) {
+      for (index_t g : axis_points) x[c * ng + g] = 0;
+    }
   }
 };
 
@@ -69,6 +75,7 @@ struct Problem {
   const std::vector<Source>& sources;
   const std::vector<Receiver>& receivers;
   const TimeConfig& time;
+  int azimuthal_order = 0;
 };
 
 // Explicit central-difference time stepping of the semi-discrete system
@@ -102,8 +109,9 @@ class Solver {
   int domain_index(Medium m) const;
 
   // Initial conditions (field and its time derivative, [comp][n_global]) of
-  // the domain of `medium`. Only allowed before the first step. Dirichlet
-  // points are forced to zero.
+  // the domain of `medium`, in the domain's components (azimuthal order 1
+  // elastic: U+, U-, U_z). Only allowed before the first step. Dirichlet
+  // and axis points are forced to zero.
   void set_state(Medium medium, const std::vector<double>& u, const std::vector<double>& v);
 
   // Receiver traces: [n_samples][ncomp] for quantity q of receiver r.
@@ -126,6 +134,7 @@ class Solver {
   // Wavefield snapshots, stored per element point (constrained points
   // interpolated), so they can be drawn element by element:
   //   data: [snapshot][component][element point], float.
+  // Azimuthal order 1 elastic snapshots hold (U_r, U_theta, U_z).
   struct Snapshot {
     Medium medium;
     std::string quantity;
@@ -190,6 +199,7 @@ class Solver {
   basis::Rule glj_;
   basis::LagrangeBasis lagrange_glj_;
   bool axisym_ = false;
+  int azimuthal_order_ = 0;
   std::vector<Domain> domains_;
   std::vector<SourceTerm> sources_;
   std::vector<ReceiverTerm> receivers_;

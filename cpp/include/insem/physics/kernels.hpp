@@ -25,7 +25,8 @@ struct KernelBasis {
 
 // Internal forces f = -K u of one block (CPU backend), with element-local
 // layouts [element][component][k]:
-//   elastic:  u, f have 2 components (x, z)
+//   elastic:  u, f have 2 components (x, z; axisymmetric: r, z), or in
+//             azimuthal order 1 three (U+, U-, U_z, docs/DESIGN.md §2.5)
 //   acoustic: u = p, f have 1 component
 // Only the elements of the block are written.
 void elastic_internal_forces(const KernelBasis& basis, const ops::ElementBlock& block,

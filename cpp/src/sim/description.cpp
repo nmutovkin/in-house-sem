@@ -139,6 +139,10 @@ Source Source::monopole(double x, double z, SourceTimeFunction stf) {
   return {Kind::Monopole, {x, z}, {1.0, 0.0, 0.0}, std::move(stf)};
 }
 
+Source Source::dipole(double x, double z, double fx, double fz, SourceTimeFunction stf) {
+  return {Kind::Dipole, {x, z}, {fx, fz, 0.0}, std::move(stf)};
+}
+
 std::string Source::kind_name() const {
   switch (kind) {
     case Kind::Force:
@@ -147,13 +151,17 @@ std::string Source::kind_name() const {
       return "moment_tensor";
     case Kind::Monopole:
       return "monopole";
+    case Kind::Dipole:
+      return "dipole";
   }
   return "unknown";
 }
 
-int quantity_components(const std::string& quantity, Medium medium) {
+int quantity_components(const std::string& quantity, Medium medium, int azimuthal_order) {
   if (medium == Medium::Elastic) {
-    if (quantity == "displacement" || quantity == "velocity" || quantity == "acceleration") return 2;
+    if (quantity == "displacement" || quantity == "velocity" || quantity == "acceleration") {
+      return azimuthal_order == 0 ? 2 : 3;
+    }
   } else {
     if (quantity == "pressure") return 1;
     if (quantity == "particle_velocity") return 2;

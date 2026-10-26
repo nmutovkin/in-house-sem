@@ -189,6 +189,20 @@ inline real_t weak_divergence_xy(const real_t* Dx, const real_t* Dy, const real_
   return s;
 }
 
+// Spreads the axis-point terms g_j (weight x stress-like factor at axis
+// point (0, j)) of an axial element over the nodes through dphi_a/dr:
+// f_a -= sum_j g_j dphi_a/dr (0, j), the test-side limit of phi_a / r.
+template <int NG>
+inline void spread_axis_term(const real_t* Dx, const real_t* Dy, const real_t* m, const real_t* g, real_t* f) {
+  // dphi_a/dr at axis point (0, jq) = xi_r Dx[0][ia] (row jq) + eta_r Dy[jq][ja] (column 0).
+  for (int jq = 0; jq < NG; ++jq) {
+    const int kq = jq * NG;
+    const real_t xi_r = m[5 * kq], eta_r = m[5 * kq + 2];
+    for (int ia = 0; ia < NG; ++ia) f[jq * NG + ia] -= g[jq] * xi_r * Dx[ia];
+    for (int ja = 0; ja < NG; ++ja) f[ja * NG] -= g[jq] * eta_r * Dy[jq * NG + ja];
+  }
+}
+
 template <int NG>
 void elastic_axisym_kernel(const KernelBasis& kb, const ops::ElementBlock& blk, const real_t* u, real_t* f) {
   constexpr int NPE = NG * NG;
@@ -244,16 +258,7 @@ void elastic_axisym_kernel(const KernelBasis& kb, const ops::ElementBlock& blk, 
         fz[k] = -weak_divergence_xy<NG>(Dx, Dy, f1z, f2z, i, j);
       }
     }
-    if (axial) {
-      // dphi_a/dr at axis point (0, jq) = xi_r Dx[0][ia] (row jq) + eta_r Dy[jq][ja] (column 0).
-      for (int jq = 0; jq < NG; ++jq) {
-        const int kq = jq * NG;
-        const real_t g = axis_g[jq];
-        const real_t xi_r = m[5 * kq], eta_r = m[5 * kq + 2];
-        for (int ia = 0; ia < NG; ++ia) fr[jq * NG + ia] -= g * xi_r * Dx[ia];
-        for (int ja = 0; ja < NG; ++ja) fr[ja * NG] -= g * eta_r * Dy[jq * NG + ja];
-      }
-    }
+    if (axial) spread_axis_term<NG>(Dx, Dy, m, axis_g, fr);
   }
 }
 
@@ -288,10 +293,147 @@ void acoustic_axisym_kernel(const KernelBasis& kb, const ops::ElementBlock& blk,
   }
 }
 
+// ---- azimuthal order 1 (docs/DESIGN.md §2.5)
+//
+// Fields u_r = U_r cos, u_theta = U_theta sin, u_z = U_z cos (theta), stored
+// as U+ = (U_r + U_theta) / sqrt 2, U- = (U_r - U_theta) / sqrt 2, U_z. On
+// the axis U+ = U_z = 0, and the 1/r terms take their limits there:
+//   e_rr = d_r U_r, e_zz = d_z U_z, e_tt = sqrt2 U+ / r, g_rz = d_z U_r + d_r U_z,
+//   g_rt = d_r U_theta - sqrt2 U+ / r, g_tz = d_z U_theta - U_z / r,
+// with U+ / r -> d_r U+ and U_z / r -> d_r U_z on the axis, on the trial and
+// test sides alike. The weak form is per pi (the theta integral of cos^2).
+template <int NG>
+void elastic_axisym1_kernel(const KernelBasis& kb, const ops::ElementBlock& blk, const real_t* u, real_t* f) {
+  constexpr int NPE = NG * NG;
+  const real_t s2 = real_t(1.41421356237309504880);
+  const real_t is2 = real_t(0.70710678118654752440);
+  const index_t nb = blk.size();
+#pragma omp parallel for schedule(static)
+  for (index_t b = 0; b < nb; ++b) {
+    const std::size_t e = static_cast<std::size_t>(blk.elements[b]);
+    const bool axial = blk.axial[b] != 0;
+    const real_t* Dx = axial ? kb.Dj.data() : kb.D.data();
+    const real_t* Dy = kb.D.data();
+    const real_t* up = u + e * 3 * NPE;
+    const real_t* um = up + NPE;
+    const real_t* uz = um + NPE;
+    const std::size_t p0 = static_cast<std::size_t>(b) * NPE;
+    const real_t* m = blk.metric.data() + p0 * 5;
+    real_t f1p[NPE], f2p[NPE], f1m[NPE], f2m[NPE], f1z[NPE], f2z[NPE];
+    real_t direct_p[NPE], direct_z[NPE], axis_p[NG], axis_z[NG];
+    for (int j = 0; j < NG; ++j) {
+      for (int i = 0; i < NG; ++i) {
+        const int k = j * NG + i;
+        const std::size_t p = p0 + k;
+        real_t up_xi, up_eta, um_xi, um_eta, uz_xi, uz_eta;
+        reference_derivatives_xy<NG>(Dx, Dy, up, i, j, up_xi, up_eta);
+        reference_derivatives_xy<NG>(Dx, Dy, um, i, j, um_xi, um_eta);
+        reference_derivatives_xy<NG>(Dx, Dy, uz, i, j, uz_xi, uz_eta);
+        const real_t xi_r = m[5 * k], xi_z = m[5 * k + 1], eta_r = m[5 * k + 2], eta_z = m[5 * k + 3];
+        real_t up_r, up_z, um_r, um_z, uz_r, uz_z;
+        physical_gradient(up_xi, up_eta, xi_r, xi_z, eta_r, eta_z, up_r, up_z);
+        physical_gradient(um_xi, um_eta, xi_r, xi_z, eta_r, eta_z, um_r, um_z);
+        physical_gradient(uz_xi, uz_eta, xi_r, xi_z, eta_r, eta_z, uz_r, uz_z);
+        const real_t r = blk.r[p];
+        const bool on_axis = r == real_t(0);
+        const real_t up_over_r = on_axis ? up_r : up[k] / r;
+        const real_t uz_over_r = on_axis ? uz_r : uz[k] / r;
+        const real_t ur_r = (up_r + um_r) * is2, ur_z = (up_z + um_z) * is2;
+        const real_t ut_r = (up_r - um_r) * is2, ut_z = (up_z - um_z) * is2;
+        const real_t e_tt = s2 * up_over_r;
+        const real_t lambda = blk.coef0[p], mu = blk.coef1[p];
+        const real_t tr = ur_r + uz_z + e_tt;
+        const real_t srr = lambda * tr + 2 * mu * ur_r;
+        const real_t szz = lambda * tr + 2 * mu * uz_z;
+        const real_t stt = lambda * tr + 2 * mu * e_tt;
+        const real_t srz = mu * (ur_z + uz_r);
+        const real_t srt = mu * (ut_r - s2 * up_over_r);
+        const real_t stz = mu * (ut_z - uz_over_r);
+        const real_t w = blk.wr[p];
+        // Gradient terms: W_r pairs with (s_rr, s_rz), W_theta with (s_rt, s_tz).
+        reference_flux(w, (srr + srt) * is2, (srz + stz) * is2, xi_r, xi_z, eta_r, eta_z, f1p[k], f2p[k]);
+        reference_flux(w, (srr - srt) * is2, (srz - stz) * is2, xi_r, xi_z, eta_r, eta_z, f1m[k], f2m[k]);
+        reference_flux(w, srz, szz, xi_r, xi_z, eta_r, eta_z, f1z[k], f2z[k]);
+        // 1/r terms of the test function: W+ / r and W_z / r.
+        const real_t cp = s2 * (stt - srt), cz = -stz;
+        if (axial && i == 0) {
+          direct_p[k] = direct_z[k] = 0;
+          axis_p[j] = w * cp;
+          axis_z[j] = w * cz;
+        } else {
+          direct_p[k] = blk.hoop[p] * cp;
+          direct_z[k] = blk.hoop[p] * cz;
+        }
+      }
+    }
+    real_t* fp = f + e * 3 * NPE;
+    real_t* fm = fp + NPE;
+    real_t* fz = fm + NPE;
+    for (int j = 0; j < NG; ++j) {
+      for (int i = 0; i < NG; ++i) {
+        const int k = j * NG + i;
+        fp[k] = -(weak_divergence_xy<NG>(Dx, Dy, f1p, f2p, i, j) + direct_p[k]);
+        fm[k] = -weak_divergence_xy<NG>(Dx, Dy, f1m, f2m, i, j);
+        fz[k] = -(weak_divergence_xy<NG>(Dx, Dy, f1z, f2z, i, j) + direct_z[k]);
+      }
+    }
+    if (axial) {
+      spread_axis_term<NG>(Dx, Dy, m, axis_p, fp);
+      spread_axis_term<NG>(Dx, Dy, m, axis_z, fz);
+    }
+  }
+}
+
+// Acoustic, p = P cos(theta): -int (1/rho) [grad W . grad P + W P / r^2] r,
+// P = 0 on the axis and P / r -> d_r P there.
+template <int NG>
+void acoustic_axisym1_kernel(const KernelBasis& kb, const ops::ElementBlock& blk, const real_t* p_in, real_t* f) {
+  constexpr int NPE = NG * NG;
+  const index_t nb = blk.size();
+#pragma omp parallel for schedule(static)
+  for (index_t b = 0; b < nb; ++b) {
+    const std::size_t e = static_cast<std::size_t>(blk.elements[b]);
+    const bool axial = blk.axial[b] != 0;
+    const real_t* Dx = axial ? kb.Dj.data() : kb.D.data();
+    const real_t* Dy = kb.D.data();
+    const real_t* pe = p_in + e * NPE;
+    const std::size_t p0 = static_cast<std::size_t>(b) * NPE;
+    const real_t* m = blk.metric.data() + p0 * 5;
+    real_t f1[NPE], f2[NPE], direct[NPE], axis_g[NG];
+    for (int j = 0; j < NG; ++j) {
+      for (int i = 0; i < NG; ++i) {
+        const int k = j * NG + i;
+        const std::size_t p = p0 + k;
+        real_t p_xi, p_eta;
+        reference_derivatives_xy<NG>(Dx, Dy, pe, i, j, p_xi, p_eta);
+        const real_t xi_r = m[5 * k], xi_z = m[5 * k + 1], eta_r = m[5 * k + 2], eta_z = m[5 * k + 3];
+        real_t p_r, p_z;
+        physical_gradient(p_xi, p_eta, xi_r, xi_z, eta_r, eta_z, p_r, p_z);
+        const real_t inv_rho = blk.coef0[p];
+        reference_flux(blk.wr[p] * inv_rho, p_r, p_z, xi_r, xi_z, eta_r, eta_z, f1[k], f2[k]);
+        if (axial && i == 0) {
+          direct[k] = 0;
+          axis_g[j] = blk.wr[p] * inv_rho * p_r;
+        } else {
+          direct[k] = blk.hoop[p] * inv_rho * pe[k] / blk.r[p];
+        }
+      }
+    }
+    real_t* fe = f + e * NPE;
+    for (int j = 0; j < NG; ++j) {
+      for (int i = 0; i < NG; ++i) {
+        const int k = j * NG + i;
+        fe[k] = -(weak_divergence_xy<NG>(Dx, Dy, f1, f2, i, j) + direct[k]);
+      }
+    }
+    if (axial) spread_axis_term<NG>(Dx, Dy, m, axis_g, fe);
+  }
+}
+
 using KernelFn = void (*)(const KernelBasis&, const ops::ElementBlock&, const real_t*, real_t*);
 
 template <int NG>
-KernelFn select_kind(bool elastic, GeometryKind kind) {
+KernelFn select_kind(bool elastic, GeometryKind kind, int azimuthal_order) {
   switch (kind) {
     case GeometryKind::Rect:
       return elastic ? &elastic_kernel<NG, GeometryKind::Rect> : &acoustic_kernel<NG, GeometryKind::Rect>;
@@ -300,21 +442,25 @@ KernelFn select_kind(bool elastic, GeometryKind kind) {
     case GeometryKind::Curved:
       return elastic ? &elastic_kernel<NG, GeometryKind::Curved> : &acoustic_kernel<NG, GeometryKind::Curved>;
     case GeometryKind::Axisym:
+      if (azimuthal_order == 1) return elastic ? &elastic_axisym1_kernel<NG> : &acoustic_axisym1_kernel<NG>;
       return elastic ? &elastic_axisym_kernel<NG> : &acoustic_axisym_kernel<NG>;
   }
   return nullptr;
 }
 
-KernelFn select(bool elastic, int ngll, GeometryKind kind) {
+KernelFn select(bool elastic, int ngll, GeometryKind kind, int azimuthal_order) {
+  INSEM_CHECK(azimuthal_order == 0 || (azimuthal_order == 1 && kind == GeometryKind::Axisym),
+              "no kernel for azimuthal order " << azimuthal_order << " on " << geometry::to_string(kind)
+                                               << " elements");
   switch (ngll) {
-    case 2: return select_kind<2>(elastic, kind);
-    case 3: return select_kind<3>(elastic, kind);
-    case 4: return select_kind<4>(elastic, kind);
-    case 5: return select_kind<5>(elastic, kind);
-    case 6: return select_kind<6>(elastic, kind);
-    case 7: return select_kind<7>(elastic, kind);
-    case 8: return select_kind<8>(elastic, kind);
-    case 9: return select_kind<9>(elastic, kind);
+    case 2: return select_kind<2>(elastic, kind, azimuthal_order);
+    case 3: return select_kind<3>(elastic, kind, azimuthal_order);
+    case 4: return select_kind<4>(elastic, kind, azimuthal_order);
+    case 5: return select_kind<5>(elastic, kind, azimuthal_order);
+    case 6: return select_kind<6>(elastic, kind, azimuthal_order);
+    case 7: return select_kind<7>(elastic, kind, azimuthal_order);
+    case 8: return select_kind<8>(elastic, kind, azimuthal_order);
+    case 9: return select_kind<9>(elastic, kind, azimuthal_order);
     default:
       throw Error("no kernel for " + std::to_string(ngll) + " GLL points (supported: " +
                   std::to_string(kMinNgll) + ".." + std::to_string(kMaxNgll) + ")");
@@ -340,12 +486,12 @@ KernelBasis KernelBasis::from_rule(const std::vector<double>& nodes, const std::
 
 void elastic_internal_forces(const KernelBasis& basis, const ops::ElementBlock& block,
                              const real_t* u_local, real_t* f_local) {
-  select(true, basis.ngll, block.kind)(basis, block, u_local, f_local);
+  select(true, basis.ngll, block.kind, block.azimuthal_order)(basis, block, u_local, f_local);
 }
 
 void acoustic_internal_forces(const KernelBasis& basis, const ops::ElementBlock& block,
                               const real_t* p_local, real_t* f_local) {
-  select(false, basis.ngll, block.kind)(basis, block, p_local, f_local);
+  select(false, basis.ngll, block.kind, block.azimuthal_order)(basis, block, p_local, f_local);
 }
 
 }  // namespace insem::physics

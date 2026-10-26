@@ -9,22 +9,23 @@ The architecture, roadmap and open questions are in
 
 ## Status
 
-Milestones **M0–M3** are done: a verified 2D acoustic–elastic solver on CPU
+Milestones **M0–M4** are done: a verified 2D acoustic–elastic solver on CPU
 with fluid–solid coupling and adaptive meshes, in Cartesian (x, z) and
-**axisymmetric (r, z)** form, with a borehole template, a discrete-wavenumber
-reference and STC for **monopole sonic logging** in open and cased holes.
+**axisymmetric (r, z)** form with azimuthal orders 0 and 1, with a borehole
+template, discrete-wavenumber and modal references, STC and dispersion
+analysis for **monopole and dipole sonic logging** in open and cased holes.
 
 | Area | What exists |
 |---|---|
-| Physics | isotropic elastic and acoustic (pressure formulation), fluid–solid coupling; Cartesian 2D (P–SV) and **axisymmetric** (true 3D fields for axisymmetric models: monopole sonic logging) |
+| Physics | isotropic elastic and acoustic (pressure formulation), fluid–solid coupling; Cartesian 2D (P–SV) and **axisymmetric** (true 3D fields for axisymmetric models) in azimuthal order 0 (monopole) or **1 (dipole: fields ∝ cos θ, sin θ)** |
 | Meshes | templates (`rectangle`, `layered` with curved interfaces, **`borehole`** with annuli, beds and radial grading) or Gmsh (`.msh` 2.2/4.1); adaptive quadtree refinement (points per wavelength at f_max, boxes) with 2:1 balance and hanging nodes |
 | Discretisation | GLL spectral elements of order 1–8; GLJ points along r in elements on the axis; element blocks by geometry kind; deterministic assembly |
 | Time stepping | explicit central differences; stable Δt from power iteration (coupled operator included); discrete energy monitor |
 | Boundaries | free / rigid / Stacey absorbing per boundary tag; symmetry axis |
-| Sources | point force, moment tensor, acoustic monopole (3D point sources on the axis, ring sources off it); Ricker, Gaussian, Gaussian derivative or sampled time functions |
-| Receivers | displacement, velocity, acceleration (elastic); pressure, particle velocity (acoustic) |
-| Output | case and results files (HDF5), snapshots, ParaView (XDMF) and SEG-Y rev 2 export, **slowness–time coherence** |
-| References | `insem.reference.borehole_axis_pressure`: discrete-wavenumber solution for a monopole in a fluid-filled borehole with any fluid/solid annuli |
+| Sources | point force, moment tensor, acoustic monopole, **acoustic dipole** (point force in a fluid); in axisymmetric models 3D point sources on the axis, ring sources off it; Ricker, Gaussian, Gaussian derivative or sampled time functions |
+| Receivers | displacement, velocity, acceleration (elastic; azimuthal order 1: r, θ, z amplitudes); pressure, particle velocity (acoustic) |
+| Output | case and results files (HDF5), snapshots, ParaView (XDMF) and SEG-Y rev 2 export, **slowness–time coherence**, **dispersion** (frequency–slowness semblance) |
+| References | `insem.reference`: discrete-wavenumber solutions for a monopole (`borehole_axis_pressure`) or a dipole (`borehole_dipole_pressure`) in a fluid-filled borehole with any fluid/solid annuli; Stoneley and flexural phase slowness by modal root-finding (`borehole_mode_slowness`) |
 | Interfaces | Python API, YAML configs and the `insem` command, C++ `insem-run` |
 
 Verification (all against independent references; see `tests/python`):
@@ -37,7 +38,10 @@ Verification (all against independent references; see `tests/python`):
 | **Axisymmetric vs 3D analytic**: fluid point source; elastic vertical force, explosion | 0.05–0.7 %; 0.1–0.6 % |
 | **Borehole monopole vs discrete-wavenumber reference**: open hole; cased hole (steel + cement) | 0.2–0.9 %; 0.2–0.6 % |
 | STC picks of SEM vs reference arrays (P, S, Stoneley) | identical |
-| Energy conservation (also refined, axisymmetric); refinement-interface reflection | round-off; −66 dB at ~7.5 points/wavelength |
+| **Dipole (azimuthal order 1) vs 3D analytic**: fluid dipole; elastic horizontal force | 0.07–1.1 %; 0.15–0.2 % |
+| **Borehole dipole vs discrete-wavenumber reference** (slow formation, flexural wave) | 0.3–0.4 % |
+| Flexural STC (SEM vs reference); flexural dispersion of SEM array vs modal root-finding | identical; ≤ 0.6 % at 3–5 kHz |
+| Energy conservation (also refined, axisymmetric, dipole); refinement-interface reflection | round-off; −66 dB at ~7.5 points/wavelength |
 
 ## Building
 
@@ -91,6 +95,20 @@ pressure = sim.solver.trace("h1", "pressure")   # (n_samples, 1)
 sim.save("case.h5")                             # re-run with: insem-run case.h5
 ```
 
+A dipole sonic source in a borehole (axisymmetric mesh, azimuthal order 1:
+fields vary as cos θ, receivers record the amplitudes at θ = 0):
+
+```python
+b = mesh.borehole((-1.5, 4.5), [("mud", 0.1)], formation_radius=4.0, dz=0.08)
+sim = insem.Simulation(b.mesh, insem.Discretization(order=4, f_max=7500.0, azimuthal_order=1))
+sim.set_material(b.regions["mud"], insem.Material.acoustic(vp=1500.0, rho=1000.0))
+sim.set_material(b.regions["formation"], insem.Material.elastic(vp=2500.0, vs=1000.0, rho=2200.0))
+for name in ("bottom", "outer", "top"):
+    sim.set_boundary(b.boundaries[name], "absorbing")
+sim.add_source(insem.Source.dipole(0.0, 0.0, fx=1.0, fz=0.0, stf=insem.ricker(3000.0)))
+sim.add_receiver("rx", 0.05, 2.0, ["pressure"])  # off the axis: P = 0 on it
+```
+
 The same through a YAML file and the command line:
 
 ```sh
@@ -104,6 +122,8 @@ More examples:
 | Example | What it shows |
 |---|---|
 | `examples/borehole/run.py` | monopole sonic log in open and cased holes: mesh, snapshots, array waveforms vs the discrete-wavenumber reference, STC |
+| `examples/borehole/dipole.py` | dipole vs monopole in a slow formation: snapshots, dipole waveforms vs the reference, STC, flexural dispersion vs modal root-finding |
+| `examples/yaml/dipole_slow_formation.yaml` | dipole sonic log (azimuthal order 1) as a YAML configuration |
 | `examples/yaml/cased_hole.yaml` | cased hole crossing a sand bed, as a YAML configuration |
 | `examples/layered_2d/run.py` | two-layer elastic model with a curved interface, double-couple source, receiver line |
 | `examples/gmsh_seabed/run.py` | Gmsh mesh (curved seabed, buried lens), wavelength-based refinement, fluid–solid coupling, snapshot and gather plots; `make_mesh.py` regenerates the mesh with Gmsh |

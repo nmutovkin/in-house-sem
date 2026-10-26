@@ -43,6 +43,24 @@ def test_acoustic_monopole_matches_green_function():
     assert errors[1] < 0.6 * errors[0]
 
 
+def test_acoustic_dipole_matches_green_function():
+    # The dipole field weights the spectrum by frequency, so it needs more
+    # resolution than the monopole: order 4 / 5 / 6 give 2.3 / 0.9 / 0.5 %.
+    c, rho = 1.0, 1.3
+    sim = open_box(4.0, 32, 6, insem.Material.acoustic(c, rho))
+    stf = insem.ricker(1.0)
+    sim.add_source(insem.Source.dipole(0.0, 0.0, 0.6, -0.8, stf))
+    receivers = {"a": (1.5, 0.7), "b": (-0.9, 1.2)}
+    for name, (x, z) in receivers.items():
+        sim.add_receiver(name, x, z, ["pressure"])
+    sim.set_time(duration=4.5)
+    sim.run()
+    s = sim.solver
+    for name, (x, z) in receivers.items():
+        exact = analytic.acoustic_dipole_pressure(s.times, stf(s.times), x, z, c, 0.6, -0.8)
+        assert analytic.rel_l2(s.trace(name, "pressure")[:, 0], exact) < 0.01  # 0.45-0.5 %
+
+
 def test_acoustic_particle_velocity():
     c, rho, xr, zr = 1.0, 1.0, 1.2, -0.9
     sim = open_box(4.0, 40, 5, insem.Material.acoustic(c, rho))

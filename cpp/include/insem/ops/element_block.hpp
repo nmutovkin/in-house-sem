@@ -26,6 +26,8 @@ namespace insem::ops {
 //   r:     radius, exactly 0 on the axis
 // and per element `axial` (the element's xi = -1 face is on the axis and
 // its xi direction uses GLJ points). metric is 5 per point, as Curved.
+// `azimuthal_order` is the Fourier order m in theta of the fields (§2.5):
+// m = 0 elastic fields are (u_r, u_z), m = 1 elastic fields (U+, U-, U_z).
 struct ElementBlock {
   geometry::GeometryKind kind = geometry::GeometryKind::Curved;
   std::vector<index_t> elements;  // domain-local element indices
@@ -34,6 +36,7 @@ struct ElementBlock {
   std::vector<real_t> coef1;
   std::vector<real_t> wr, hoop, r;
   std::vector<char> axial;
+  int azimuthal_order = 0;
 
   index_t size() const { return static_cast<index_t>(elements.size()); }
 };
@@ -47,7 +50,7 @@ inline constexpr int metric_stride(geometry::GeometryKind kind) {
 ElementBlock build_axisym_block(const std::vector<index_t>& leaves, const geometry::Geometry& geom,
                                 const std::vector<double>& coef0, const std::vector<double>& coef1,
                                 const std::vector<double>& wr, const std::vector<double>& hoop,
-                                const std::vector<char>& axial);
+                                const std::vector<char>& axial, int azimuthal_order = 0);
 
 // Splits a (Cartesian) domain into blocks by geometry kind.
 //   leaves:    forest leaf of each domain element

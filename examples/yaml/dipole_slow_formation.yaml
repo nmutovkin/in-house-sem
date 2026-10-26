@@ -1,0 +1,25 @@
+# Dipole sonic log in a slow formation (shear slower than the mud): the
+# flexural wave carries the shear slowness. Azimuthal order 1: the source is
+# a horizontal point force in the mud on the axis, the hydrophones sit at
+# half the borehole radius and record the cos(theta) pressure amplitude.
+# Run with:  insem run examples/yaml/dipole_slow_formation.yaml
+mesh:
+  borehole:
+    z: [-1.5, 4.5]
+    annuli: [[mud, 0.1]]
+    formation_radius: 4.0
+    dz: 0.08
+    dr: 0.3
+discretization: {order: 4, f_max: 7500, azimuthal_order: 1}
+materials:
+  mud:       {medium: acoustic, vp: 1500, rho: 1000}
+  formation: {medium: elastic, vp: 2500, vs: 1000, rho: 2200}
+boundaries: {bottom: absorbing, outer: absorbing, top: absorbing}
+sources:
+  - {type: dipole, position: [0, 0], fx: 1.0, stf: {type: ricker, f0: 3000}}
+receivers:
+  - {line: {start: [0.05, 1.0], end: [0.05, 2.4], n: 8}, prefix: rx, quantities: [pressure]}
+time: {duration: 0.0036, record_every: 4}
+output:
+  directory: dipole_slow_formation_out
+  segy: [{quantity: pressure, file: array.sgy}]

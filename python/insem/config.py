@@ -25,6 +25,8 @@ Mesh: exactly one of ``rectangle`` (arguments of ``mesh.rectangle``),
 ``gmsh`` (``{file: ..., plane: xy}``) or ``borehole`` (``mesh.borehole``,
 axisymmetric; ``annuli: [[mud, 0.1], [casing, 0.11]]``,
 ``beds: [[z_bottom, name], ...]``), plus optional ``coords``.
+``discretization.azimuthal_order: 1`` selects dipole (cos theta) fields in
+axisymmetric models, driven by ``dipole`` (fluid) or ``force`` sources.
 Materials and boundaries are keyed by region / tag ids or by names: the
 template boundary names bottom/right/top/left, borehole region and
 boundary names (bottom/outer/top), or Gmsh physical names.
@@ -172,7 +174,9 @@ def _source(cfg, base: Path):
                                           float(cfg.get("mxz", 0.0)), stf)
     if kind == "monopole":
         return _core.Source.monopole(x, z, stf)
-    raise ConfigError(f"source: unknown type '{kind}' (force, moment_tensor, monopole)")
+    if kind == "dipole":
+        return _core.Source.dipole(x, z, float(cfg.get("fx", 0.0)), float(cfg.get("fz", 0.0)), stf)
+    raise ConfigError(f"source: unknown type '{kind}' (force, moment_tensor, monopole, dipole)")
 
 
 def _receivers(cfg) -> List[tuple]:
@@ -201,7 +205,7 @@ def build(cfg: Dict[str, Any], base_dir=".") -> Built:
 
     disc_cfg = dict(cfg.get("discretization", {}))
     _check_keys("discretization", disc_cfg, {"order", "uniform_level", "f_max", "points_per_wavelength",
-                                             "max_level", "regions"})
+                                             "max_level", "regions", "azimuthal_order"})
     regions = []
     for r in disc_cfg.pop("regions", []):
         _check_keys("discretization.regions", r, {"x", "z", "level"}, ["x", "z", "level"])

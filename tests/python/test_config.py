@@ -129,3 +129,12 @@ def test_borehole_config():
     assert len(sim.receivers) == 8 and sim.receivers[0].position[0] == 0.0
     with pytest.raises(config.ConfigError, match="axisymmetric"):
         config.build(dict(cfg, mesh=dict(cfg["mesh"], coords="cartesian")))
+
+
+def test_dipole_config():
+    cfg = yaml.safe_load((Path(__file__).parents[2] / "examples" / "yaml" / "dipole_slow_formation.yaml").read_text())
+    sim = config.build(cfg).simulation
+    assert sim.discretization.azimuthal_order == 1
+    assert [s.kind for s in sim.sources] == ["dipole"]
+    assert sim.sources[0].components[0] == 1.0
+    assert all(r.position[0] == 0.05 for r in sim.receivers)

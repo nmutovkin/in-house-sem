@@ -14,7 +14,8 @@ def _info(path: str) -> None:
     sim = _core.Simulation.load(path)
     sim.setup()
     m = sim.mesh
-    print(f"{path}: {m.n_cells} {m.cell_type} macro-cells ({m.coords}), order {sim.discretization.order}")
+    mode = f", azimuthal order {sim.discretization.azimuthal_order}" if m.coords == "axisymmetric" else ""
+    print(f"{path}: {m.n_cells} {m.cell_type} macro-cells ({m.coords}{mode}), order {sim.discretization.order}")
     print(f"  elements {sim.dofs.n_elements}, max level {sim.forest.max_level}, "
           f"geometry kinds {sim.geometry_kind_counts()}")
     for region, mat in sim.materials.items():

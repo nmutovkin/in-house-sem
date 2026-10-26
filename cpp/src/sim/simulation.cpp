@@ -46,6 +46,10 @@ Simulation::Simulation(std::shared_ptr<const mesh::MacroMesh> mesh, Discretizati
   INSEM_CHECK(disc_.max_level >= disc_.uniform_level && disc_.max_level <= mesh::Forest::kMaxLevel,
               "max_level " << disc_.max_level << " must be in [uniform_level, " << mesh::Forest::kMaxLevel << "]");
   INSEM_CHECK(disc_.f_max >= 0.0 && disc_.points_per_wavelength > 0.0, "invalid wavelength refinement parameters");
+  INSEM_CHECK(disc_.azimuthal_order == 0 || disc_.azimuthal_order == 1,
+              "azimuthal order " << disc_.azimuthal_order << " is not supported (0 or 1)");
+  INSEM_CHECK(disc_.azimuthal_order == 0 || mesh_->coord_system() == mesh::CoordSystem::Axisymmetric,
+              "azimuthal order " << disc_.azimuthal_order << " needs an axisymmetric mesh");
   for (const auto& r : disc_.regions) {
     INSEM_CHECK(r.xmin <= r.xmax && r.zmin <= r.zmax && r.level >= 0 && r.level <= mesh::Forest::kMaxLevel,
                 "invalid refinement region");
@@ -214,8 +218,9 @@ std::map<std::string, index_t> Simulation::geometry_kind_counts() const {
 solver::Solver& Simulation::solver() {
   if (!solver_) {
     setup();
-    const solver::Problem problem{*forest_, *geometry_, *gll_, materials_, boundaries_,
-                                  sources_, receivers_, time_};
+    const solver::Problem problem{*forest_,    *geometry_, *gll_,  materials_,
+                                  boundaries_, sources_,   receivers_, time_,
+                                  disc_.azimuthal_order};
     solver_ = std::make_unique<solver::Solver>(problem);
   }
   return *solver_;
@@ -254,6 +259,7 @@ void Simulation::save(const std::string& path) const {
   f.set_attribute("/discretization", "f_max", disc_.f_max);
   f.set_attribute("/discretization", "points_per_wavelength", disc_.points_per_wavelength);
   f.set_attribute("/discretization", "max_level", static_cast<std::int64_t>(disc_.max_level));
+  f.set_attribute("/discretization", "azimuthal_order", static_cast<std::int64_t>(disc_.azimuthal_order));
   std::vector<double> regions;
   for (const auto& r : disc_.regions) regions.insert(regions.end(), {r.xmin, r.xmax, r.zmin, r.zmax, double(r.level)});
   f.write("/discretization/regions", regions.data(), {disc_.regions.size(), 5});
@@ -349,6 +355,9 @@ Simulation Simulation::load(const std::string& path) {
       disc.regions.push_back({r[i], r[i + 1], r[i + 2], r[i + 3], static_cast<int>(r[i + 4])});
     }
   }
+  if (f.has_attribute("/discretization", "azimuthal_order")) {
+    disc.azimuthal_order = static_cast<int>(f.attribute_int("/discretization", "azimuthal_order"));
+  }
   Simulation sim(std::move(m), disc);
 
   // Problem description groups are optional (a mesh-only case is valid).
@@ -405,6 +414,8 @@ Simulation Simulation::load(const std::string& path) {
         sim.add_source(Source::moment_tensor(pos[0], pos[1], comp[0], comp[1], comp[2], stf));
       } else if (kind == "monopole") {
         sim.add_source(Source::monopole(pos[0], pos[1], stf));
+      } else if (kind == "dipole") {
+        sim.add_source(Source::dipole(pos[0], pos[1], comp[0], comp[1], stf));
       } else {
         throw Error("unknown source kind '" + kind + "' in " + path);
       }

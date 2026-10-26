@@ -39,6 +39,16 @@ def acoustic_pressure(t, stf, x, z, c, rho):
     return np.fft.irfft(rho * G * S, npad)[: len(t)]
 
 
+def acoustic_dipole_pressure(t, stf, x, z, c, fx, fz):
+    """Pressure of a point force (fx, fz) stf(t) in a fluid,
+    (1/kappa) p_tt = div(grad p / rho) - div(f delta / rho): p = -f . grad g."""
+    S, w, npad = _spectrum(t, stf)
+    r = np.hypot(x, z)
+    G = np.zeros_like(S)
+    G[1:] = _scalar_green(w[1:] / c, r)[1]
+    return np.fft.irfft(-(fx * x + fz * z) / r * G * S, npad)[: len(t)]
+
+
 def acoustic_particle_velocity(t, stf, x, z, c, rho):
     """Particle velocity v = -(1/rho) int grad p dt for the same source: (n, 2)."""
     S, w, npad = _spectrum(t, stf)
@@ -189,3 +199,46 @@ def elastic_displacement_3d(t, stf, r, z, vp, vs, rho, force_z=None, explosion=N
         U = np.array([-explosion / (rho * vp**2) * gqp * e[i] for i in range(2)])
     U[:, 0] = 0.0
     return np.array([np.fft.irfft(U[i] * S, npad)[: len(t)] for i in range(2)]).T
+
+
+def acoustic_dipole_pressure_3d(t, stf, r, z, c, fx=1.0):
+    """Mode amplitude P (p = P cos theta) at (r, z) of a horizontal 3D point
+    force fx stf(t) e_x at the origin of a fluid,
+    (1/kappa) p_tt = div(grad p / rho) - div(f delta / rho):
+    p = -fx d_x g = -fx g'(R) x / R, independent of the density.
+    """
+    S, w, npad = _spectrum(t, stf)
+    R = np.hypot(r, z)
+    _, gp, _ = _green3d_scalar(w / c, R)
+    return np.fft.irfft(-fx * gp * (r / R) * S, npad)[: len(t)]
+
+
+def _green3d_tensor(w, e, R, i, j, vp, vs, rho):
+    """G_ij(R e) of the 3D homogeneous solid, G = (1/mu) [g_s I + (1/k_s^2) grad grad (g_s - g_p)]."""
+    mu = rho * vs * vs
+    W = w.copy()
+    W[0] = 1.0
+    gs, gsp, gspp = _green3d_scalar(W / vs, R)
+    _, gqp, gqpp = _green3d_scalar(W / vp, R)
+    d = 1.0 if i == j else 0.0
+    hs = gspp * e[i] * e[j] + gsp / R * (d - e[i] * e[j])
+    hp = gqpp * e[i] * e[j] + gqp / R * (d - e[i] * e[j])
+    G = (gs * d + (hs - hp) / (W / vs) ** 2) / mu
+    G[0] = 0.0
+    return G
+
+
+def elastic_horizontal_force_3d(t, stf, r, z, vp, vs, rho, fx=1.0):
+    """Mode amplitudes (U_r, U_theta, U_z), with u = (U_r cos, U_theta sin,
+    U_z cos)(theta), at (r, z) of a horizontal point force fx stf(t) e_x at
+    the origin of a 3D homogeneous solid: U_r = G_xx, U_z = G_zx at theta = 0
+    and U_theta = u_theta(theta = 90 deg) = -G_xx there.
+    """
+    S, w, npad = _spectrum(t, stf)
+    R = np.hypot(r, z)
+    e0 = np.array([r / R, 0.0, z / R])   # (x, y, z) direction at theta = 0
+    e90 = np.array([0.0, r / R, z / R])  # at theta = 90 degrees
+    U = [_green3d_tensor(w, e0, R, 0, 0, vp, vs, rho),
+         -_green3d_tensor(w, e90, R, 0, 0, vp, vs, rho),
+         _green3d_tensor(w, e0, R, 2, 0, vp, vs, rho)]
+    return np.array([np.fft.irfft(fx * u * S, npad)[: len(t)] for u in U]).T

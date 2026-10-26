@@ -38,6 +38,10 @@ class Results:
     snapshot_mesh: Dict[str, Tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
     #: (medium, quantity) -> (n_snapshots, ncomp, n_points)
     snapshots: Dict[Tuple[str, str], np.ndarray] = field(default_factory=dict)
+    #: "cartesian" or "axisymmetric", and the azimuthal order (traces and
+    #: snapshots of order 1 are mode amplitudes, components r, theta, z)
+    coords: str = "cartesian"
+    azimuthal_order: int = 0
 
     def trace(self, receiver: str, quantity: str) -> np.ndarray:
         return self.traces[(receiver, quantity)]
@@ -65,6 +69,8 @@ def read_results(path) -> Results:
             receivers=receivers,
             traces=traces,
             energy=f["energy"][()] if "energy" in f else np.zeros((0, 3)),
+            coords=_text(f.attrs.get("coords", "cartesian")),
+            azimuthal_order=int(f.attrs.get("azimuthal_order", 0)),
         )
         if "snapshots" in f:
             snap = f["snapshots"]
@@ -81,14 +87,19 @@ def read_results(path) -> Results:
 
 # ------------------------------------------------------------------- XDMF
 
-_COMPONENTS = {1: [""], 2: ["_x", "_z"]}
+_COMPONENTS = {1: [""], 2: ["_x", "_z"], 3: ["_r", "_theta", "_z"]}
+
+# Component names of vector quantities, by number of components (x is also
+# r in axisymmetric models).
+_COMPONENT_INDEX = {2: {"x": 0, "r": 0, "z": 1}, 3: {"r": 0, "theta": 1, "z": 2}}
 
 
 def write_xdmf(results_path, xdmf_path=None) -> Path:
     """Write an XDMF file for the wavefield snapshots of a results file.
 
     Opens in ParaView (Xdmf3 reader) as a time series with one block per
-    medium; vector quantities appear as _x / _z components. The data is
+    medium; vector quantities appear as _x / _z components (_r / _theta /
+    _z for azimuthal order 1). The data is
     written to a sidecar HDF5 file next to the XDMF file.
     """
     import h5py
@@ -176,12 +187,17 @@ def write_segy(
                                                           if (n, quantity) in res.traces]
     if not names:
         raise ValueError(f"no receiver recorded '{quantity}'")
-    comp = {"x": 0, "z": 1}.get(component, component) if isinstance(component, str) else component
     data = []
     for n in names:
         tr = res.traces.get((n, quantity))
         if tr is None:
             raise ValueError(f"receiver '{n}' did not record '{quantity}'")
+        comp = component
+        if isinstance(component, str):
+            index = _COMPONENT_INDEX.get(tr.shape[1], {})
+            if component not in index:
+                raise ValueError(f"'{quantity}' has no component '{component}' (components: {sorted(index)})")
+            comp = index[component]
         if comp >= tr.shape[1]:
             raise ValueError(f"'{quantity}' has {tr.shape[1]} component(s)")
         data.append(tr[:, comp])
@@ -366,3 +382,49 @@ def stc(traces: np.ndarray, offsets: Sequence[float], dt: float, slowness: Seque
         energy[a] = den
     coh[energy < min_energy * energy.max()] = 0.0
     return STC(slowness, times, coh)
+
+
+@dataclass
+class Dispersion:
+    """Frequency-slowness semblance of an array: semblance[frequency, slowness]."""
+
+    frequency: np.ndarray  # Hz
+    slowness: np.ndarray   # phase slowness, s/m
+    semblance: np.ndarray
+
+    def peak(self, s_min: float = 0.0, s_max: float = np.inf) -> Tuple[np.ndarray, np.ndarray]:
+        """Phase slowness and semblance of the largest semblance at each frequency."""
+        si = (self.slowness >= s_min) & (self.slowness <= s_max)
+        sub = np.where(si[None, :], self.semblance, -np.inf)
+        j = np.argmax(sub, axis=1)
+        return self.slowness[j], self.semblance[np.arange(len(j)), j]
+
+
+def dispersion(traces: np.ndarray, offsets: Sequence[float], dt: float, frequencies: Sequence[float],
+               slowness: Sequence[float], t0: float = 0.0, mute: Optional[Tuple[float, float]] = None) -> Dispersion:
+    """Phase-slowness dispersion of an array by frequency-domain semblance.
+
+    traces: (n_receivers, n_samples) sampled at t0 + i dt; offsets in m;
+    frequencies in Hz; trial phase slownesses in s/m. With X_i(f) the
+    spectrum of trace i,
+
+        semblance(f, s) = |sum_i X_i(f) e^{2 pi i f s z_i}|^2 / (N sum_i |X_i(f)|^2),
+
+    which is 1 where a single mode of phase slowness s crosses the array
+    (a frequency-domain counterpart of STC; for borehole flexural and
+    Stoneley dispersion see e.g. Lang et al. 1987). `mute` = (t_start, s)
+    zeroes the samples before t_start + s (z_i - z_0), to remove earlier
+    arrivals (e.g. P and fluid waves ahead of a flexural wave).
+    """
+    x = np.array(traces, float)
+    z = np.asarray(offsets, float)
+    t = t0 + dt * np.arange(x.shape[1])
+    if mute is not None:
+        x[t[None, :] < mute[0] + mute[1] * (z[:, None] - z[0])] = 0.0
+    f = np.asarray(frequencies, float)
+    s = np.asarray(slowness, float)
+    X = np.exp(-2j * np.pi * np.outer(f, t)) @ x.T  # (n_freq, n_receivers)
+    steer = np.exp(2j * np.pi * f[:, None, None] * s[None, :, None] * (z - z[0])[None, None, :])
+    num = np.abs((steer * X[:, None, :]).sum(axis=-1)) ** 2
+    den = len(z) * (np.abs(X) ** 2).sum(axis=-1)
+    return Dispersion(f, s, num / np.where(den > 0, den, 1.0)[:, None])
